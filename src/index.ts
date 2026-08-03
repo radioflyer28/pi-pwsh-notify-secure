@@ -28,7 +28,7 @@
  */
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 
@@ -192,6 +192,27 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 	let currentCwd: string | undefined;
 	const jobs = new Map<string, BgJob>();
 	let jobCounter = 0;
+
+	// ------------------------------------------------------------------
+	// Footer status: "1 bg job running" while background jobs are alive,
+	// like Claude Code's "1 shell running". Job exits happen outside any
+	// event handler, so the most recent ExtensionContext is captured (from
+	// session_start and pwsh calls) and reused for setStatus.
+	// ------------------------------------------------------------------
+	let uiCtx: Pick<ExtensionContext, "hasUI" | "ui"> | undefined;
+
+	function updateRunningStatus(): void {
+		if (!uiCtx?.hasUI) return;
+		let n = 0;
+		for (const j of jobs.values()) if (j.running) n++;
+		try {
+			uiCtx.ui.setStatus("pwsh-bg", n === 0 ? undefined : `${n} bg job${n === 1 ? "" : "s"} running`);
+		} catch {}
+	}
+	pi.on("session_start", (_event, ctx) => {
+		uiCtx = ctx;
+		updateRunningStatus();
+	});
 
 	// ------------------------------------------------------------------
 	// Notification queue. Job events are debounced briefly and merged into a
@@ -410,6 +431,7 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 			),
 		}),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+			uiCtx = ctx;
 			shell ??= findShell();
 			rejectTrailingAmpersand(params.command);
 			if (currentCwd && !existsSync(currentCwd)) currentCwd = undefined;
@@ -489,6 +511,7 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 					const observed = job.waiters > 0;
 					for (const w of [...job.watchers]) w();
 					if (!job.killedByTool && !observed) notifyFinished(job);
+					updateRunningStatus();
 				};
 				proc.on("error", (err) =>
 					onExit(() => {
@@ -501,6 +524,7 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 					}),
 				);
 				jobs.set(id, job);
+				updateRunningStatus();
 				return textResult(
 					`Started background job ${id}${params.name ? ` (${params.name})` : ""}, PID ${proc.pid}. You will be notified automatically${
 						readyRegex ? " when the output matches notify_on and" : ""

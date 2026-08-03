@@ -61,6 +61,7 @@ Two tools, Claude Code-shaped: background execution is a parameter, not a separa
 - On exit, a `<background-job-finished>` notification (status, runtime, last 60 output lines) is injected into the session
 - **`notify_on` regex** — for processes that never exit (dev servers, watchers): the first output match injects a one-time `<background-job-ready>` notification, so "server is up" also arrives without polling (e.g. `notify_on: "Local:.*http"` for vite)
 - Rendered in the TUI as a single tool-result-like row — `● bg job bg-1 (pytest) · exited 0 · 7s` plus the last few output lines; expand the message to see the full tail
+- **Footer status** while jobs are alive — `1 bg job running` in pi's status bar, like Claude Code's "1 shell running"; clears when the last job exits
 - `pwsh_job` output is **incremental**: each check returns only output produced since the previous one — repeated peeks don't re-burn tokens
 - **`pwsh_job wait`** — Claude Code's Monitor tool: blocks until the job's unseen output matches a `pattern` regex, or the job exits, or `timeout` seconds pass (default 120). The one legitimate way to *wait* for a job when the agent cannot proceed without the result — replaces polling loops entirely
 - Optional `timeout` to kill runaway jobs; jobs killed via `pwsh_job` do not notify
@@ -115,7 +116,7 @@ pi install npm:pi-pwsh-notify
 
 agent 在后台启动构建或 dev server 后可以继续和你对话；进程退出时，一条带退出码和输出尾部的 `<background-job-finished>` 通知会**自动注入会话，agent 立即醒来处理**——体验和 Claude Code 的后台任务一致。对 dev server 这类**永不退出**的进程，传一个 `notify_on` 正则（如 `"Local:.*http"`），输出首次匹配时注入一条 `<background-job-ready>` 就绪通知——"服务起来了"同样零轮询。
 
-通知的投递方式也复刻了 Claude Code，底层用的是 pi 官方的 steering 通道（`deliverAs: "steer"`）：**agent 正在工作时**，通知在它**下一次 LLM 调用前**注入——模型几秒内就知道"服务起来了/任务失败了"，而不是等回合结束（`followUp` 的行为）才收到一条它早已自己发现并处理过的过期消息；**agent 空闲时**由 `triggerTurn` 立即唤醒。事件先经 250ms 去抖**合并成一条消息**再发——pi 的 steering 队列每次 LLM 调用只投一条，不合并的话 N 个同时结束的任务就要多花 N 次调用。正在被 `pwsh_job wait` 阻塞等待的任务退出时，结果由 wait 的返回值直接带回，多余的结束通知会被抑制。TUI 里通知渲染成一行紧凑的状态行（`● bg job bg-1 (pytest) · exited 0 · 7s`），不会刷屏。
+通知的投递方式也复刻了 Claude Code，底层用的是 pi 官方的 steering 通道（`deliverAs: "steer"`）：**agent 正在工作时**，通知在它**下一次 LLM 调用前**注入——模型几秒内就知道"服务起来了/任务失败了"，而不是等回合结束（`followUp` 的行为）才收到一条它早已自己发现并处理过的过期消息；**agent 空闲时**由 `triggerTurn` 立即唤醒。事件先经 250ms 去抖**合并成一条消息**再发——pi 的 steering 队列每次 LLM 调用只投一条，不合并的话 N 个同时结束的任务就要多花 N 次调用。正在被 `pwsh_job wait` 阻塞等待的任务退出时，结果由 wait 的返回值直接带回，多余的结束通知会被抑制。TUI 里通知渲染成一行紧凑的状态行（`● bg job bg-1 (pytest) · exited 0 · 7s`），不会刷屏。有后台任务存活时，pi 状态栏还会显示 `1 bg job running`（对应 Claude Code 的 "1 shell running"），最后一个任务退出后自动消失。
 
 ### 工具
 
