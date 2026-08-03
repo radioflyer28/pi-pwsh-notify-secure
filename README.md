@@ -25,7 +25,16 @@ If you have hit any of these running pi on Windows, this package is the fix:
 - Windows paths get **mangled by Git Bash / MSYS path conversion** (`C:\Users\...` rewritten into `/c/Users/...` or worse)
 - the agent starts a background job, then **polls its status in a loop**, burning tokens while it waits
 
-This extension fixes both. The agent starts a build or dev server in the background, keeps chatting with you, and **when the process exits, a notification with the exit code and output tail is automatically injected into the conversation** — the agent wakes up and reacts, exactly like background tasks in Claude Code. Implemented with `pi.sendMessage(..., { deliverAs: "followUp", triggerTurn: true })` on process exit: it never interrupts a streaming response, and triggers a new turn when the agent is idle. Because it is a *custom* message rather than a fake user message, the TUI shows a compact one-line status row instead of a wall of text in a `User` box — while the LLM still receives the full tagged notification.
+This extension fixes both. The agent starts a build or dev server in the background, keeps chatting with you, and **when the process exits, a notification with the exit code and output tail is automatically injected into the conversation** — the agent wakes up and reacts, exactly like background tasks in Claude Code.
+
+Delivery also mirrors Claude Code's mechanics, built on pi's official steering channel (`deliverAs: "steer"`):
+
+- **Agent mid-turn** → pi injects the notification **before the agent's next LLM call**, so the model learns "server is up" or "job failed" within seconds, while it is still working — instead of receiving stale news after the turn ends (`followUp`), when it has often already discovered (and handled) the outcome itself.
+- **Agent idle** → `triggerTurn` wakes it immediately.
+- **Batching** → job events are debounced (250 ms) and merged into **one message**. This matters because pi's steering queue drains one message per LLM call: without merging, N jobs finishing together would cost N calls.
+- A job that exits while a `pwsh_job wait` is blocked on it is reported by the wait's own return value; the redundant finished notification is suppressed.
+
+Because notifications are *custom* messages/entries rather than fake user messages, the TUI shows a compact one-line status row instead of a wall of text in a `User` box — while the LLM still receives the full tagged notification.
 
 ## Tools
 
@@ -34,7 +43,7 @@ Two tools, Claude Code-shaped: background execution is a parameter, not a separa
 | Tool | Purpose |
 | --- | --- |
 | `pwsh` | Run a command (replaces built-in `bash`). `run_in_background: true` starts a job that **auto-notifies on exit**; `notify_on` (regex) adds a **ready notification** for servers that never exit |
-| `pwsh_job` | Background job management: incremental output / list / kill (`taskkill /T /F`) |
+| `pwsh_job` | Background job management: incremental output / **blocking wait** (Claude Code's Monitor) / list / kill (`taskkill /T /F`) |
 
 ### Foreground `pwsh`
 
@@ -53,8 +62,9 @@ Two tools, Claude Code-shaped: background execution is a parameter, not a separa
 - **`notify_on` regex** — for processes that never exit (dev servers, watchers): the first output match injects a one-time `<background-job-ready>` notification, so "server is up" also arrives without polling (e.g. `notify_on: "Local:.*http"` for vite)
 - Rendered in the TUI as a single tool-result-like row — `● bg job bg-1 (pytest) · exited 0 · 7s` plus the last few output lines; expand the message to see the full tail
 - `pwsh_job` output is **incremental**: each check returns only output produced since the previous one — repeated peeks don't re-burn tokens
+- **`pwsh_job wait`** — Claude Code's Monitor tool: blocks until the job's unseen output matches a `pattern` regex, or the job exits, or `timeout` seconds pass (default 120). The one legitimate way to *wait* for a job when the agent cannot proceed without the result — replaces polling loops entirely
 - Optional `timeout` to kill runaway jobs; jobs killed via `pwsh_job` do not notify
-- Surviving jobs are reaped when pi exits — no invisible orphan dev servers
+- Surviving jobs are reaped when pi exits — including **closing the terminal window** (SIGHUP/SIGBREAK/SIGTERM are handled, not just graceful exit), so no invisible orphan dev servers keep listening on their ports
 
 ## Built-in tool handling
 
@@ -70,6 +80,8 @@ Two tools, Claude Code-shaped: background execution is a parameter, not a separa
 | Background jobs | ✅ | via `Start-Job` | user commands only | ✅ |
 | **Agent auto-notified on completion** | ✅ | ❌ (agent must poll) | ❌ | ❌ (agent must poll) |
 | **Ready notification for never-exiting servers** (`notify_on`) | ✅ | ❌ | ❌ | ❌ |
+| **Mid-turn delivery + batching** (steered before the next LLM call; co-finishers merged into one message) | ✅ | ❌ | ❌ | ❌ |
+| **Blocking wait on pattern/exit** (Claude Code's Monitor) | ✅ | ❌ | ❌ | ❌ |
 | `cd` persists between calls | ✅ | ❌ | ❌ | ❌ |
 
 ## Requirements
@@ -101,7 +113,9 @@ pi install npm:pi-pwsh-notify
 
 ### 工作方式
 
-agent 在后台启动构建或 dev server 后可以继续和你对话；进程退出时，一条带退出码和输出尾部的 `<background-job-finished>` 通知会**自动注入会话，agent 立即醒来处理**——体验和 Claude Code 的后台任务一致。对 dev server 这类**永不退出**的进程，传一个 `notify_on` 正则（如 `"Local:.*http"`），输出首次匹配时注入一条 `<background-job-ready>` 就绪通知——"服务起来了"同样零轮询。通知从不打断正在流式输出的回复，agent 空闲时才触发新回合；TUI 里渲染成一行紧凑的状态行（`● bg job bg-1 (pytest) · exited 0 · 7s`），不会刷屏。
+agent 在后台启动构建或 dev server 后可以继续和你对话；进程退出时，一条带退出码和输出尾部的 `<background-job-finished>` 通知会**自动注入会话，agent 立即醒来处理**——体验和 Claude Code 的后台任务一致。对 dev server 这类**永不退出**的进程，传一个 `notify_on` 正则（如 `"Local:.*http"`），输出首次匹配时注入一条 `<background-job-ready>` 就绪通知——"服务起来了"同样零轮询。
+
+通知的投递方式也复刻了 Claude Code，底层用的是 pi 官方的 steering 通道（`deliverAs: "steer"`）：**agent 正在工作时**，通知在它**下一次 LLM 调用前**注入——模型几秒内就知道"服务起来了/任务失败了"，而不是等回合结束（`followUp` 的行为）才收到一条它早已自己发现并处理过的过期消息；**agent 空闲时**由 `triggerTurn` 立即唤醒。事件先经 250ms 去抖**合并成一条消息**再发——pi 的 steering 队列每次 LLM 调用只投一条，不合并的话 N 个同时结束的任务就要多花 N 次调用。正在被 `pwsh_job wait` 阻塞等待的任务退出时，结果由 wait 的返回值直接带回，多余的结束通知会被抑制。TUI 里通知渲染成一行紧凑的状态行（`● bg job bg-1 (pytest) · exited 0 · 7s`），不会刷屏。
 
 ### 工具
 
@@ -110,9 +124,9 @@ agent 在后台启动构建或 dev server 后可以继续和你对话；进程�
 | 工具 | 用途 |
 | --- | --- |
 | `pwsh` | 执行命令（替换内置 `bash`）；`run_in_background: true` 启动后台任务并**在退出时自动通知**，`notify_on` 正则为常驻进程加**就绪通知** |
-| `pwsh_job` | 后台任务管理：增量输出 / 列表 / 杀掉整棵进程树 |
+| `pwsh_job` | 后台任务管理：增量输出 / **阻塞等待**（对应 Claude Code 的 Monitor：等输出匹配正则或进程退出）/ 列表 / 杀掉整棵进程树 |
 
-前台 `pwsh`：**`cd` 在调用之间持久**（变量/函数不持久，每次都是全新 `pwsh -NoProfile -NonInteractive` 进程）；命令经 `-EncodedCommand` 传递，**嵌套引号永不出错**；强制 UTF-8（含 Python 子进程）；默认 120 秒超时并清理整棵进程树；结尾 `&` 会被拦截并提示改用后台参数（PowerShell job 会随宿主进程静默死亡）。`pwsh_job` 的输出是**增量的**——每次只返回上次检查之后的新输出，反复查看不重复烧 token。pi 退出时残留的后台任务会被统一回收，不留孤儿 dev server。
+前台 `pwsh`：**`cd` 在调用之间持久**（变量/函数不持久，每次都是全新 `pwsh -NoProfile -NonInteractive` 进程）；命令经 `-EncodedCommand` 传递，**嵌套引号永不出错**；强制 UTF-8（含 Python 子进程）；默认 120 秒超时并清理整棵进程树；结尾 `&` 会被拦截并提示改用后台参数（PowerShell job 会随宿主进程静默死亡）。`pwsh_job` 的输出是**增量的**——每次只返回上次检查之后的新输出，反复查看不重复烧 token；确实需要等结果才能继续时用 `wait`（pattern + timeout）阻塞等待，彻底取代轮询。pi 退出时残留的后台任务会被统一回收——包括**直接关掉终端窗口**（处理了 SIGHUP/SIGBREAK/SIGTERM，不只是正常退出），不留孤儿 dev server 占着端口。
 
 ### 要求
 
