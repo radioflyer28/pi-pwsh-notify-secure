@@ -1,0 +1,44 @@
+{
+  "name": "pi-pwsh-notify",
+  "version": "0.2.2",
+  "description": "pi extension: PowerShell 7 shell for Windows with Claude Code-style background jobs that auto-notify the agent on completion — no polling",
+  "type": "module",
+  "license": "MIT",
+  "author": "oversk7",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/oversk7/pi-pwsh-notify.git"
+  },
+  "homepage": "https://github.com/oversk7/pi-pwsh-notify#readme",
+  "bugs": {
+    "url": "https://github.com/oversk7/pi-pwsh-notify/issues"
+  },
+  "keywords": [
+    "pi",
+    "pi-package",
+    "pi-extension",
+    "powershell",
+    "pwsh",
+    "windows",
+    "background-jobs",
+    "shell",
+    "ai-agent"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "files": [
+    "src"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "@sinclair/typebox": "*"
+  }
+}
