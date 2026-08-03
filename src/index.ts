@@ -1,22 +1,24 @@
 /**
  * pi-pwsh-notify: PowerShell 7 shell for pi on Windows, with Claude Code-style
- * background jobs that auto-notify the agent on completion.
+ * background jobs that auto-notify the agent — no polling.
  *
- * Foreground: a `pwsh` tool replaces the built-in bash tool (bash is removed
- * from the active tool list; grep/find are removed only when pi-fff's
- * ffgrep/fffind are present to take over searching).
+ * Two tools:
+ *  - `pwsh`     foreground execution (replaces built-in bash; cd persists between
+ *               calls), or `run_in_background: true` for jobs that inject a
+ *               <background-job-finished> notification on exit. A `notify_on`
+ *               regex additionally injects a <background-job-ready> notification
+ *               on first output match — covers dev servers that never exit.
+ *  - `pwsh_job` output (incremental since last check) / list / kill.
  *
- * Background: `pwsh_bg` starts a job and returns immediately; when the process
- * exits, a <background-job-finished> notification is injected into the
- * conversation via pi.sendMessage, waking the agent — no polling.
- * `pwsh_bg_output` / `pwsh_bg_list` / `pwsh_bg_kill` manage running jobs.
+ * Notifications are *custom* messages, not fake user messages: the LLM sees the
+ * full tagged text, the TUI renders a compact tool-result-like status row.
  *
- * The notification is a *custom* message, not a fake user message: the LLM
- * still sees the full tagged text, but the TUI renders it as a compact,
- * tool-result-like status line (expand to see the output tail) instead of a
- * wall of text inside a `User` box.
+ * Commands are passed via -EncodedCommand (base64 UTF-16LE), so nested quoting
+ * never breaks. grep/find built-ins are removed only when pi-fff's
+ * ffgrep/fffind are present to take over searching.
  */
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
@@ -26,16 +28,23 @@ const FG_MAX_RESULT_CHARS = 50_000;
 const FG_LIVE_PREVIEW_CHARS = 4_000;
 const BG_MAX_BUFFER_CHARS = 400_000;
 const BG_NOTIFY_TAIL_LINES = 60;
-/** customType used for the job-finished message + its TUI renderer. */
+/** customType used for job notifications + their TUI renderer. */
 const NOTIFY_TYPE = "pwsh-bg-notify";
 /** Output lines shown in the collapsed (default) notification row. */
 const NOTIFY_COLLAPSED_LINES = 3;
+/** Marker line appended to foreground scripts to report the final $PWD; the
+ * leading SOH control char makes collisions with real output practically
+ * impossible. */
+const CWD_MARKER = String.fromCharCode(1) + "pwsh-cwd:";
+const AUTOMATED_NOTE =
+	"This is an automated notification, not the user typing. If the result affects current or planned work, act on it; otherwise report it to the user in one short sentence.";
 // BOM-less UTF-8: [System.Text.Encoding]::UTF8 emits a BOM, which corrupts the
 // first chunk piped into native stdin (e.g. `Get-Content key | ssh "cat >> file"`).
 const UTF8_PRELUDE =
 	"$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $ErrorActionPreference = 'Continue'; ";
-// pwsh -Command flattens native exit codes unless re-raised explicitly.
-const EXIT_CODE_SUFFIX = "\nif ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE }";
+// pwsh -Command/-EncodedCommand flattens native exit codes unless re-raised
+// explicitly; the marker line reports the final cwd before re-raising.
+const FG_SUFFIX = `\n$__ec = $LASTEXITCODE; Write-Output ('${CWD_MARKER}' + $PWD.Path); if ($null -ne $__ec) { exit $__ec }`;
 
 const SPAWN_ENV = {
 	PYTHONIOENCODING: "utf-8",
@@ -52,6 +61,8 @@ interface BgJob {
 	cwd: string;
 	proc: ChildProcess;
 	output: string;
+	/** Offset into `output` already returned by pwsh_job output. */
+	cursor: number;
 	truncated: boolean;
 	startedAt: number;
 	endedAt?: number;
@@ -59,6 +70,7 @@ interface BgJob {
 	running: boolean;
 	killedByTool: boolean;
 	timedOut: boolean;
+	readyNotified: boolean;
 	timer?: NodeJS.Timeout;
 }
 
@@ -74,8 +86,25 @@ function killTree(pid: number): void {
 	spawnSync("taskkill.exe", ["/PID", String(pid), "/T", "/F"], { windowsHide: true });
 }
 
-function shellArgs(command: string): string[] {
-	return ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command];
+/** -EncodedCommand keeps arbitrary quoting intact (no arg-string reparsing). */
+function shellArgs(script: string): string[] {
+	return [
+		"-NoProfile",
+		"-NonInteractive",
+		"-ExecutionPolicy",
+		"Bypass",
+		"-EncodedCommand",
+		Buffer.from(script, "utf16le").toString("base64"),
+	];
+}
+
+/** Trailing `&` creates a PowerShell job that dies with the wrapper process. */
+function rejectTrailingAmpersand(command: string): void {
+	if (/(^|[^&])&\s*$/.test(command)) {
+		throw new Error(
+			"Trailing '&' starts a PowerShell job that dies as soon as this shell process exits. Use run_in_background: true instead.",
+		);
+	}
 }
 
 function fmtDuration(ms: number): string {
@@ -122,13 +151,15 @@ interface NotifyDetails {
 
 export default function pwshNotifyExtension(pi: ExtensionAPI) {
 	let shell: string | undefined;
+	/** Persisted working directory: cd survives across pwsh calls. */
+	let currentCwd: string | undefined;
 	const jobs = new Map<string, BgJob>();
 	let jobCounter = 0;
 
 	// ------------------------------------------------------------------
-	// Compact TUI rendering for job-finished notifications. Without this the
-	// message would be dumped verbatim into a `User`-looking block, which is
-	// visually indistinguishable from something the human typed.
+	// Compact TUI rendering for job notifications. Without this the message
+	// would be dumped verbatim into a `User`-looking block, visually
+	// indistinguishable from something the human typed.
 	// ------------------------------------------------------------------
 	pi.registerMessageRenderer<NotifyDetails>(NOTIFY_TYPE, (message, { expanded }, theme) => {
 		const d = message.details;
@@ -197,33 +228,206 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 		}
 	});
 
+	function sendNotify(
+		job: BgJob,
+		tag: string,
+		headline: string,
+		output: string,
+		status: string,
+		ok: boolean,
+		dur: string,
+	): void {
+		const content = [
+			`<${tag} id="${job.id}">`,
+			headline,
+			`Command: ${job.command}`,
+			output,
+			`</${tag}>`,
+			AUTOMATED_NOTE,
+		].join("\n");
+		const details: NotifyDetails = {
+			id: job.id,
+			name: job.name,
+			status,
+			ok,
+			duration: dur,
+			command: job.command,
+			output,
+		};
+		try {
+			// A custom message keeps the LLM payload identical while letting the
+			// TUI show a one-line status row. triggerTurn wakes an idle agent.
+			pi.sendMessage<NotifyDetails>(
+				{ customType: NOTIFY_TYPE, content, display: true, details },
+				{ deliverAs: "followUp", triggerTurn: true },
+			);
+		} catch {
+			// The session may already be gone in print/RPC mode; a failed
+			// notification must not affect the job itself.
+		}
+	}
+
+	function notifyFinished(job: BgJob): void {
+		const dur = fmtDuration((job.endedAt ?? Date.now()) - job.startedAt);
+		const label = job.name ? `${job.id} (${job.name})` : job.id;
+		const out = tailLines(job.output, BG_NOTIFY_TAIL_LINES).trim();
+		const status = statusOf(job);
+		sendNotify(
+			job,
+			"background-job-finished",
+			`Job ${label} — status: ${status}, runtime ${dur}`,
+			`--- output tail (last ${BG_NOTIFY_TAIL_LINES} lines) ---\n${out || "(no output)"}`,
+			status,
+			!job.timedOut && !job.killedByTool && job.exitCode === 0,
+			dur,
+		);
+	}
+
+	function notifyReady(job: BgJob, matchedLine: string): void {
+		const dur = fmtDuration(Date.now() - job.startedAt);
+		const label = job.name ? `${job.id} (${job.name})` : job.id;
+		sendNotify(
+			job,
+			"background-job-ready",
+			`Job ${label} is ready — output matched notify_on after ${dur}; the process keeps running.`,
+			`Matched: ${matchedLine}`,
+			"ready",
+			true,
+			dur,
+		);
+	}
+
 	// ------------------------------------------------------------------
-	// Foreground pwsh tool (replaces built-in bash)
+	// pwsh: foreground execution, or background with run_in_background
 	// ------------------------------------------------------------------
 	pi.registerTool({
 		name: "pwsh",
 		label: "pwsh",
 		description:
-			`Execute a command in PowerShell 7 on Windows and return its combined stdout/stderr. Each call is a fresh non-interactive process started in the project directory — cd, variables, and functions do NOT persist between calls; chain dependent steps in one command. Default timeout ${FG_DEFAULT_TIMEOUT_SEC}s (override with timeout param). Long-running or never-ending commands (dev servers, watchers, big builds) must use pwsh_bg instead.`,
+			`Run a command in PowerShell 7 on Windows; returns combined stdout/stderr. cd persists between calls; variables and functions do not (fresh process per call — chain dependent steps in one command). Foreground calls are killed after ${FG_DEFAULT_TIMEOUT_SEC}s by default (timeout param). For anything long-running or never-ending (dev servers, watchers, builds, test suites) set run_in_background: true — returns a job id immediately, and a <background-job-finished> notification with exit code and output tail is injected automatically when the process exits; no polling. For servers that never exit, also pass notify_on (regex): the first output match injects a <background-job-ready> notification, e.g. notify_on: "Local:.*http" for vite.`,
 		promptSnippet: "Run PowerShell 7 command (the shell on this Windows machine)",
 		promptGuidelines: [
 			"The shell is PowerShell 7, not bash: use PowerShell syntax ($env:VAR, cmdlets, PowerShell quoting). && and || work. Windows and forward-slash paths both accepted.",
 			"Never run interactive commands (Read-Host, pause, git rebase -i): the process is non-interactive and they will hang until timeout.",
+			"After starting a background job, continue with other work or end your turn; ready/finished notifications arrive on their own. Use pwsh_job to peek at intermediate output or kill a job — never to poll for completion.",
 		],
 		parameters: Type.Object({
 			command: Type.String({ description: "PowerShell command line to run" }),
+			run_in_background: Type.Optional(
+				Type.Boolean({
+					description: "Run as a background job: returns a job id immediately, auto-notifies on exit.",
+				}),
+			),
 			timeout: Type.Optional(
 				Type.Number({
-					description: `Timeout in seconds (default ${FG_DEFAULT_TIMEOUT_SEC}). The process tree is killed on timeout.`,
+					description: `Seconds before the process tree is killed. Default: ${FG_DEFAULT_TIMEOUT_SEC} foreground, unlimited background.`,
+				}),
+			),
+			name: Type.Optional(Type.String({ description: "Short human-readable job name (background only)" })),
+			notify_on: Type.Optional(
+				Type.String({
+					description:
+						"Background only: regex tested against job output; the first match injects a one-time <background-job-ready> notification. Use for dev servers/watchers that never exit.",
 				}),
 			),
 		}),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			shell ??= findShell();
+			rejectTrailingAmpersand(params.command);
+			if (currentCwd && !existsSync(currentCwd)) currentCwd = undefined;
+			const cwd = currentCwd ?? ctx.cwd;
+
+			// ---------- background ----------
+			if (params.run_in_background) {
+				let readyRegex: RegExp | undefined;
+				if (params.notify_on) {
+					try {
+						readyRegex = new RegExp(params.notify_on, "m");
+					} catch (err) {
+						throw new Error(`Invalid notify_on regex: ${String(err)}`);
+					}
+				}
+				const id = `bg-${++jobCounter}`;
+				const proc = spawn(shell, shellArgs(UTF8_PRELUDE + params.command), {
+					cwd,
+					windowsHide: true,
+					stdio: ["ignore", "pipe", "pipe"],
+					env: { ...process.env, ...SPAWN_ENV },
+				});
+				const job: BgJob = {
+					id,
+					name: params.name,
+					command: params.command,
+					cwd,
+					proc,
+					output: "",
+					cursor: 0,
+					truncated: false,
+					startedAt: Date.now(),
+					exitCode: null,
+					running: true,
+					killedByTool: false,
+					timedOut: false,
+					readyNotified: false,
+				};
+				const append = (chunk: Buffer) => {
+					job.output += chunk.toString("utf8");
+					if (job.output.length > BG_MAX_BUFFER_CHARS) {
+						const dropped = job.output.length - BG_MAX_BUFFER_CHARS;
+						job.output = job.output.slice(dropped);
+						job.cursor = Math.max(0, job.cursor - dropped);
+						job.truncated = true;
+					}
+					if (readyRegex && !job.readyNotified) {
+						const m = readyRegex.exec(job.output);
+						if (m) {
+							job.readyNotified = true;
+							const start = job.output.lastIndexOf("\n", m.index) + 1;
+							const end = job.output.indexOf("\n", m.index);
+							notifyReady(job, job.output.slice(start, end === -1 ? undefined : end).trim());
+						}
+					}
+				};
+				proc.stdout?.on("data", append);
+				proc.stderr?.on("data", append);
+				if (params.timeout && params.timeout > 0) {
+					job.timer = setTimeout(() => {
+						if (job.running && proc.pid) {
+							job.timedOut = true;
+							killTree(proc.pid);
+						}
+					}, params.timeout * 1000);
+					job.timer.unref?.();
+				}
+				proc.on("error", (err) => {
+					if (!job.running) return;
+					job.running = false;
+					job.endedAt = Date.now();
+					job.output += `\n[spawn error] ${err.message}`;
+					if (job.timer) clearTimeout(job.timer);
+					notifyFinished(job);
+				});
+				proc.on("close", (code) => {
+					if (!job.running) return;
+					job.running = false;
+					job.endedAt = Date.now();
+					job.exitCode = code;
+					if (job.timer) clearTimeout(job.timer);
+					if (!job.killedByTool) notifyFinished(job);
+				});
+				jobs.set(id, job);
+				return textResult(
+					`Started background job ${id}${params.name ? ` (${params.name})` : ""}, PID ${proc.pid}. You will be notified automatically${
+						readyRegex ? " when the output matches notify_on and" : ""
+					} when it finishes.`,
+				);
+			}
+
+			// ---------- foreground ----------
 			const timeoutSec = params.timeout ?? FG_DEFAULT_TIMEOUT_SEC;
 			return await new Promise((resolve, reject) => {
-				const proc = spawn(shell!, shellArgs(UTF8_PRELUDE + params.command + EXIT_CODE_SUFFIX), {
-					cwd: ctx.cwd,
+				const proc = spawn(shell!, shellArgs(UTF8_PRELUDE + params.command + FG_SUFFIX), {
+					cwd,
 					windowsHide: true,
 					stdio: ["ignore", "pipe", "pipe"],
 					env: { ...process.env, ...SPAWN_ENV },
@@ -259,12 +463,25 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 				});
 				proc.on("close", (code) => {
 					cleanup();
-					let text = out.trim();
+					const notes: string[] = [];
+					// Extract the cwd marker line (absent if the command exited early).
+					let text = out;
+					const mi = text.lastIndexOf(CWD_MARKER);
+					if (mi >= 0) {
+						const le = text.indexOf("\n", mi);
+						const dir = text.slice(mi + CWD_MARKER.length, le === -1 ? undefined : le).trim();
+						text = text.slice(0, mi) + (le === -1 ? "" : text.slice(le + 1));
+						if (dir && dir !== cwd) notes.push(`cwd is now ${dir}`);
+						if (dir) currentCwd = dir;
+					}
+					text = text.trim();
 					if (text.length > FG_MAX_RESULT_CHARS) {
 						text = `[output truncated, showing tail]\n${tailChars(text, FG_MAX_RESULT_CHARS)}`;
 					}
-					const notes: string[] = [];
-					if (timedOut) notes.push(`command timed out after ${timeoutSec}s and was killed`);
+					if (timedOut)
+						notes.push(
+							`command timed out after ${timeoutSec}s and was killed. If this is a dev server or watcher, rerun with run_in_background: true`,
+						);
 					else if (aborted) notes.push("command aborted");
 					else if (code !== 0) notes.push(`exit code: ${code}`);
 					if (notes.length > 0) text = text ? `${text}\n\n${notes.join("; ")}` : notes.join("; ");
@@ -275,192 +492,53 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 	});
 
 	// ------------------------------------------------------------------
-	// Background jobs: pwsh_bg + output / list / kill, auto-notify on exit
+	// pwsh_job: output (incremental) / list / kill
 	// ------------------------------------------------------------------
-	function notify(job: BgJob): void {
-		const dur = fmtDuration((job.endedAt ?? Date.now()) - job.startedAt);
-		const label = job.name ? `${job.id} (${job.name})` : job.id;
-		const out = tailLines(job.output, BG_NOTIFY_TAIL_LINES).trim();
-		const status = statusOf(job);
-		const content = [
-			`<background-job-finished id="${job.id}">`,
-			`Job ${label} — status: ${status}, runtime ${dur}`,
-			`Command: ${job.command}`,
-			`--- output tail (last ${BG_NOTIFY_TAIL_LINES} lines) ---`,
-			out || "(no output)",
-			`</background-job-finished>`,
-			"This is an automated notification, not the user typing. If the result affects current or planned work, act on it; otherwise report it to the user in one short sentence.",
-		].join("\n");
-		const details: NotifyDetails = {
-			id: job.id,
-			name: job.name,
-			status,
-			ok: !job.timedOut && !job.killedByTool && job.exitCode === 0,
-			duration: dur,
-			command: job.command,
-			output: out,
-		};
-		try {
-			// A custom message keeps the LLM payload identical to before while
-			// letting the TUI show a one-line status row. triggerTurn wakes an
-			// idle agent the same way sendUserMessage used to.
-			pi.sendMessage<NotifyDetails>(
-				{ customType: NOTIFY_TYPE, content, display: true, details },
-				{ deliverAs: "followUp", triggerTurn: true },
-			);
-		} catch {
-			// The session may already be gone in print/RPC mode; a failed
-			// notification must not affect the job itself.
-		}
-	}
-
 	pi.registerTool({
-		name: "pwsh_bg",
-		label: "pwsh_bg",
+		name: "pwsh_job",
+		label: "pwsh_job",
 		description:
-			"Run a command in a background PowerShell 7 process. Returns immediately with a job id. When the process exits, a <background-job-finished> notification with exit code and output tail is automatically injected into the conversation — no polling needed. Use for anything long-running: builds, test suites, dev servers, downloads.",
-		promptSnippet: "Run command in background PowerShell (auto-notifies on completion)",
-		promptGuidelines: [
-			"Use pwsh_bg instead of pwsh for commands that run longer than ~30s or indefinitely (dev servers, watchers, builds).",
-			"After starting a background job, continue with other work or end your turn; completion arrives automatically. Only use pwsh_bg_output when you need intermediate output from a still-running job.",
-		],
+			'Manage background jobs started with pwsh run_in_background. action "output": return output produced since the previous check (lines caps it; lines=0 returns the full captured buffer). action "list": all jobs with status. action "kill": kill the job and its process tree — no completion notification for jobs you kill.',
+		promptSnippet: "Background job output / list / kill",
 		parameters: Type.Object({
-			command: Type.String({ description: "PowerShell command line to run" }),
-			name: Type.Optional(Type.String({ description: "Short human-readable job name" })),
-			cwd: Type.Optional(Type.String({ description: "Working directory (default: current)" })),
-			timeout_sec: Type.Optional(
-				Type.Number({ description: "Kill the job after this many seconds (default: no timeout)" }),
-			),
-		}),
-		executionMode: "parallel",
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			shell ??= findShell();
-			const id = `bg-${++jobCounter}`;
-			const cwd = params.cwd ?? ctx.cwd;
-			const proc = spawn(shell, shellArgs(UTF8_PRELUDE + params.command), {
-				cwd,
-				windowsHide: true,
-				stdio: ["ignore", "pipe", "pipe"],
-				env: { ...process.env, ...SPAWN_ENV },
-			});
-			const job: BgJob = {
-				id,
-				name: params.name,
-				command: params.command,
-				cwd,
-				proc,
-				output: "",
-				truncated: false,
-				startedAt: Date.now(),
-				exitCode: null,
-				running: true,
-				killedByTool: false,
-				timedOut: false,
-			};
-			const append = (chunk: Buffer) => {
-				job.output += chunk.toString("utf8");
-				if (job.output.length > BG_MAX_BUFFER_CHARS) {
-					job.output = job.output.slice(job.output.length - BG_MAX_BUFFER_CHARS);
-					job.truncated = true;
-				}
-			};
-			proc.stdout?.on("data", append);
-			proc.stderr?.on("data", append);
-			if (params.timeout_sec && params.timeout_sec > 0) {
-				job.timer = setTimeout(() => {
-					if (job.running && proc.pid) {
-						job.timedOut = true;
-						killTree(proc.pid);
-					}
-				}, params.timeout_sec * 1000);
-				job.timer.unref?.();
-			}
-			proc.on("error", (err) => {
-				if (!job.running) return;
-				job.running = false;
-				job.endedAt = Date.now();
-				job.output += `\n[spawn error] ${err.message}`;
-				if (job.timer) clearTimeout(job.timer);
-				notify(job);
-			});
-			proc.on("close", (code) => {
-				if (!job.running) return;
-				job.running = false;
-				job.endedAt = Date.now();
-				job.exitCode = code;
-				if (job.timer) clearTimeout(job.timer);
-				if (!job.killedByTool) notify(job);
-			});
-			jobs.set(id, job);
-			return textResult(
-				`Started background job ${id}${params.name ? ` (${params.name})` : ""}, PID ${proc.pid}. You will be notified automatically when it finishes.`,
-			);
-		},
-	});
-
-	pi.registerTool({
-		name: "pwsh_bg_output",
-		label: "pwsh_bg_output",
-		description: "Read the output captured so far from a background job started with pwsh_bg.",
-		promptSnippet: "Read background job output",
-		parameters: Type.Object({
-			id: Type.String({ description: "Job id, e.g. bg-1" }),
+			action: Type.Union([Type.Literal("output"), Type.Literal("list"), Type.Literal("kill")]),
+			id: Type.Optional(Type.String({ description: "Job id, e.g. bg-1 (required for output and kill)" })),
 			lines: Type.Optional(
-				Type.Number({ description: "Tail lines to return (default 100, 0 = full captured buffer)" }),
+				Type.Number({ description: "output only: max tail lines to return (default 100, 0 = full buffer)" }),
 			),
 		}),
 		executionMode: "parallel",
 		async execute(_toolCallId, params) {
-			const job = jobs.get(params.id);
-			if (!job) {
-				throw new Error(`No such job: ${params.id}. Known jobs: ${[...jobs.keys()].join(", ") || "none"}`);
+			if (params.action === "list") {
+				if (jobs.size === 0) return textResult("No background jobs this session.");
+				const rows = [...jobs.values()].map((j) => {
+					const cmd = j.command.length > 80 ? `${j.command.slice(0, 80)}…` : j.command;
+					return `${j.id}${j.name ? ` (${j.name})` : ""} — ${statusOf(j)} — ${cmd}`;
+				});
+				return textResult(rows.join("\n"));
 			}
+			const job = params.id ? jobs.get(params.id) : undefined;
+			if (!job) {
+				throw new Error(
+					`No such job: ${params.id ?? "(id missing)"}. Known jobs: ${[...jobs.keys()].join(", ") || "none"}`,
+				);
+			}
+			if (params.action === "kill") {
+				if (!job.running) return textResult(`${job.id} already finished (${statusOf(job)}).`);
+				job.killedByTool = true;
+				if (job.proc.pid) killTree(job.proc.pid);
+				return textResult(`Killed ${job.id} (PID ${job.proc.pid}).`);
+			}
+			// action === "output": incremental since the previous check
 			const n = params.lines ?? 100;
-			const body = n === 0 ? job.output : tailLines(job.output, n);
+			const fresh = job.output.slice(job.cursor);
+			job.cursor = job.output.length;
+			const body = n === 0 ? job.output : tailLines(fresh, n);
 			const dur = fmtDuration((job.endedAt ?? Date.now()) - job.startedAt);
 			const head = `${job.id} — ${statusOf(job)}, ${job.running ? "running for" : "ran"} ${dur}${
 				job.truncated ? " (buffer truncated, oldest output dropped)" : ""
-			}`;
-			return textResult(`${head}\n${body.trim() || "(no output yet)"}`);
-		},
-	});
-
-	pi.registerTool({
-		name: "pwsh_bg_list",
-		label: "pwsh_bg_list",
-		description: "List all background jobs started this session with their status.",
-		promptSnippet: "List background jobs",
-		parameters: Type.Object({}),
-		executionMode: "parallel",
-		async execute() {
-			if (jobs.size === 0) return textResult("No background jobs this session.");
-			const rows = [...jobs.values()].map((j) => {
-				const cmd = j.command.length > 80 ? `${j.command.slice(0, 80)}…` : j.command;
-				return `${j.id}${j.name ? ` (${j.name})` : ""} — ${statusOf(j)} — ${cmd}`;
-			});
-			return textResult(rows.join("\n"));
-		},
-	});
-
-	pi.registerTool({
-		name: "pwsh_bg_kill",
-		label: "pwsh_bg_kill",
-		description:
-			"Kill a running background job and its child processes. No completion notification is sent for jobs you kill.",
-		promptSnippet: "Kill a background job",
-		parameters: Type.Object({
-			id: Type.String({ description: "Job id, e.g. bg-1" }),
-		}),
-		executionMode: "parallel",
-		async execute(_toolCallId, params) {
-			const job = jobs.get(params.id);
-			if (!job) {
-				throw new Error(`No such job: ${params.id}. Known jobs: ${[...jobs.keys()].join(", ") || "none"}`);
-			}
-			if (!job.running) return textResult(`${job.id} already finished (${statusOf(job)}).`);
-			job.killedByTool = true;
-			if (job.proc.pid) killTree(job.proc.pid);
-			return textResult(`Killed ${job.id} (PID ${job.proc.pid}).`);
+			}${n === 0 ? "" : fresh ? ", new output since last check:" : ""}`;
+			return textResult(`${head}\n${body.trim() || (n === 0 ? "(no output)" : "(no new output since last check)")}`);
 		},
 	});
 }

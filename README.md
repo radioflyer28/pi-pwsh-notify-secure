@@ -29,28 +29,31 @@ This extension fixes both. The agent starts a build or dev server in the backgro
 
 ## Tools
 
+Two tools, Claude Code-shaped: background execution is a parameter, not a separate tool.
+
 | Tool | Purpose |
 | --- | --- |
-| `pwsh` | Foreground command execution (replaces built-in `bash`) |
-| `pwsh_bg` | Start a background job; **auto-notifies on completion** |
-| `pwsh_bg_output` | Peek at a running job's captured output |
-| `pwsh_bg_list` | List jobs and their status |
-| `pwsh_bg_kill` | Kill a job and its child processes (`taskkill /T /F`) |
+| `pwsh` | Run a command (replaces built-in `bash`). `run_in_background: true` starts a job that **auto-notifies on exit**; `notify_on` (regex) adds a **ready notification** for servers that never exit |
+| `pwsh_job` | Background job management: incremental output / list / kill (`taskkill /T /F`) |
 
 ### Foreground `pwsh`
 
-- Fresh `pwsh -NoProfile -NonInteractive` process per call, started in the project directory
+- **`cd` persists between calls** (tracked by the extension); variables and functions do not — each call is a fresh `pwsh -NoProfile -NonInteractive` process
+- Commands are passed via `-EncodedCommand` — **nested quoting never breaks**
 - UTF-8 forced on both PowerShell and Python child processes — non-ASCII output renders correctly
-- Default 120s timeout (overridable per call); the whole process **tree** is killed on timeout or abort
-- Native exit codes survive the `pwsh -Command` flattening (`exit $LASTEXITCODE` re-raise)
+- Default 120s timeout (overridable per call); the whole process **tree** is killed on timeout, with a hint to rerun with `run_in_background` if it looks like a server
+- A trailing `&` is rejected with a pointer to `run_in_background` — a PowerShell job would die silently with the wrapper process
+- Native exit codes survive the `-Command` flattening (`exit $LASTEXITCODE` re-raise)
 - Live output streaming while the command runs
 
-### Background `pwsh_bg`
+### Background (`run_in_background: true`)
 
 - Returns immediately with a job id; output captured in memory (last 400 KB)
 - On exit, a `<background-job-finished>` notification (status, runtime, last 60 output lines) is injected into the session
+- **`notify_on` regex** — for processes that never exit (dev servers, watchers): the first output match injects a one-time `<background-job-ready>` notification, so "server is up" also arrives without polling (e.g. `notify_on: "Local:.*http"` for vite)
 - Rendered in the TUI as a single tool-result-like row — `● bg job bg-1 (pytest) · exited 0 · 7s` plus the last few output lines; expand the message to see the full tail
-- Optional `timeout_sec` to kill runaway jobs; jobs killed via `pwsh_bg_kill` do not notify
+- `pwsh_job` output is **incremental**: each check returns only output produced since the previous one — repeated peeks don't re-burn tokens
+- Optional `timeout` to kill runaway jobs; jobs killed via `pwsh_job` do not notify
 - Surviving jobs are reaped when pi exits — no invisible orphan dev servers
 
 ## Built-in tool handling
@@ -66,6 +69,8 @@ This extension fixes both. The agent starts a build or dev server in the backgro
 | Foreground PowerShell | ✅ | ✅ | translation layer over bash | ✅ (adds tool) |
 | Background jobs | ✅ | via `Start-Job` | user commands only | ✅ |
 | **Agent auto-notified on completion** | ✅ | ❌ (agent must poll) | ❌ | ❌ (agent must poll) |
+| **Ready notification for never-exiting servers** (`notify_on`) | ✅ | ❌ | ❌ | ❌ |
+| `cd` persists between calls | ✅ | ❌ | ❌ | ❌ |
 
 ## Requirements
 
@@ -73,7 +78,7 @@ This extension fixes both. The agent starts a build or dev server in the backgro
 
 ## Notes
 
-- Each `pwsh` call is a fresh process: `cd`, variables, and functions do not persist between calls (by design — keeps `/fork` and session replay sane).
+- Each `pwsh` call is a fresh process: variables and functions do not persist between calls. `cd` *does* persist — the extension tracks the final working directory of every call.
 - Provided as-is; issues and PRs welcome but response times are not guaranteed.
 
 ---
@@ -96,19 +101,18 @@ pi install npm:pi-pwsh-notify
 
 ### 工作方式
 
-agent 在后台启动构建或 dev server 后可以继续和你对话；进程退出时，一条带退出码和输出尾部的 `<background-job-finished>` 通知会**自动注入会话，agent 立即醒来处理**——体验和 Claude Code 的后台任务一致。通知从不打断正在流式输出的回复，agent 空闲时才触发新回合；TUI 里渲染成一行紧凑的状态行（`● bg job bg-1 (pytest) · exited 0 · 7s`），不会刷屏。
+agent 在后台启动构建或 dev server 后可以继续和你对话；进程退出时，一条带退出码和输出尾部的 `<background-job-finished>` 通知会**自动注入会话，agent 立即醒来处理**——体验和 Claude Code 的后台任务一致。对 dev server 这类**永不退出**的进程，传一个 `notify_on` 正则（如 `"Local:.*http"`），输出首次匹配时注入一条 `<background-job-ready>` 就绪通知——"服务起来了"同样零轮询。通知从不打断正在流式输出的回复，agent 空闲时才触发新回合；TUI 里渲染成一行紧凑的状态行（`● bg job bg-1 (pytest) · exited 0 · 7s`），不会刷屏。
 
 ### 工具
 
+只有两个工具，形状和 Claude Code 一致——后台执行是参数，不是单独的工具。
+
 | 工具 | 用途 |
 | --- | --- |
-| `pwsh` | 前台执行（替换内置 `bash`） |
-| `pwsh_bg` | 启动后台任务，**完成时自动通知** |
-| `pwsh_bg_output` | 查看运行中任务的输出 |
-| `pwsh_bg_list` | 列出任务及状态 |
-| `pwsh_bg_kill` | 杀掉任务及其子进程树 |
+| `pwsh` | 执行命令（替换内置 `bash`）；`run_in_background: true` 启动后台任务并**在退出时自动通知**，`notify_on` 正则为常驻进程加**就绪通知** |
+| `pwsh_job` | 后台任务管理：增量输出 / 列表 / 杀掉整棵进程树 |
 
-前台 `pwsh` 每次调用都是全新的 `pwsh -NoProfile -NonInteractive` 进程，强制 UTF-8（含 Python 子进程），默认 120 秒超时，超时/中止时清理整棵进程树；pi 退出时残留的后台任务会被统一回收，不留孤儿 dev server。
+前台 `pwsh`：**`cd` 在调用之间持久**（变量/函数不持久，每次都是全新 `pwsh -NoProfile -NonInteractive` 进程）；命令经 `-EncodedCommand` 传递，**嵌套引号永不出错**；强制 UTF-8（含 Python 子进程）；默认 120 秒超时并清理整棵进程树；结尾 `&` 会被拦截并提示改用后台参数（PowerShell job 会随宿主进程静默死亡）。`pwsh_job` 的输出是**增量的**——每次只返回上次检查之后的新输出，反复查看不重复烧 token。pi 退出时残留的后台任务会被统一回收，不留孤儿 dev server。
 
 ### 要求
 
