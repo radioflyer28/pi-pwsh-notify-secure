@@ -56,9 +56,13 @@ const AUTOMATED_NOTE =
 // first chunk piped into native stdin (e.g. `Get-Content key | ssh "cat >> file"`).
 const UTF8_PRELUDE =
 	"$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $ErrorActionPreference = 'Continue'; ";
-// pwsh -Command/-EncodedCommand flattens native exit codes unless re-raised
-// explicitly; the marker line reports the final cwd before re-raising.
+// pwsh -Command/-EncodedCommand flattens native exit codes to 0/1 unless
+// re-raised explicitly; the marker line reports the final cwd before re-raising.
 const FG_SUFFIX = `\n$__ec = $LASTEXITCODE; Write-Output ('${CWD_MARKER}' + $PWD.Path); if ($null -ne $__ec) { exit $__ec }`;
+// Background jobs need the same re-raise (so `cmd /c "exit 3"` notifies exit 3,
+// not 1) but no cwd marker — it would pollute the captured output and the
+// notification tail.
+const BG_SUFFIX = `\n$__ec = $LASTEXITCODE; if ($null -ne $__ec) { exit $__ec }`;
 
 const SPAWN_ENV = {
 	PYTHONIOENCODING: "utf-8",
@@ -448,7 +452,7 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 					}
 				}
 				const id = `bg-${++jobCounter}`;
-				const proc = spawn(shell, shellArgs(UTF8_PRELUDE + params.command), {
+				const proc = spawn(shell, shellArgs(UTF8_PRELUDE + params.command + BG_SUFFIX), {
 					cwd,
 					windowsHide: true,
 					stdio: ["ignore", "pipe", "pipe"],
