@@ -82,6 +82,8 @@ export interface BgJob {
 	output: string;
 	/** Offset into `output` already returned by pwsh_job output/wait. */
 	cursor: number;
+	/** A chunk may end between CR and LF; skip that LF on the next chunk. */
+	pendingCarriageReturn: boolean;
 	truncated: boolean;
 	startedAt: number;
 	endedAt?: number;
@@ -232,6 +234,8 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 	// session_start and pwsh calls) and reused for setStatus.
 	// ------------------------------------------------------------------
 	let uiCtx: Pick<ExtensionContext, "hasUI" | "ui"> | undefined;
+	/** Set on session teardown; async job exits after that must not notify. */
+	let shutdown = false;
 
 	function updateRunningStatus(): void {
 		jobList.update();
@@ -331,7 +335,7 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 				].join(" "),
 				theme.fg("dim", `  ${ellipsize(d.command, 110)}`),
 			);
-			const out = d.output.trim();
+			const out = d.output.replace(/\r\n?/g, "\n").trim();
 			if (out) {
 				const all = out.split("\n");
 				const shown = expanded ? all : all.slice(-NOTIFY_COLLAPSED_LINES);
@@ -413,10 +417,12 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 	// them over — and unregister everything registered above so repeated
 	// reloads don't accumulate listeners, timers, or widgets.
 	pi.on("session_shutdown", () => {
+		shutdown = true;
 		reap();
 		process.off("exit", reap);
 		for (const sig of SIGNALS) process.off(sig, onSignal);
 		jobList.dispose();
+		uiCtx = undefined;
 		if (flushTimer) {
 			clearTimeout(flushTimer);
 			flushTimer = undefined;
@@ -521,6 +527,7 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 					proc,
 					output: "",
 					cursor: 0,
+					pendingCarriageReturn: false,
 					truncated: false,
 					startedAt: Date.now(),
 					exitCode: null,
@@ -533,7 +540,17 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 					mutex: Promise.resolve(),
 				};
 				const append = (chunk: Buffer) => {
-					job.output += chunk.toString("utf8");
+					// PowerShell writes CRLF on Windows. A raw CR in a TUI render moves
+					// the terminal cursor to column zero, which can overwrite the overlay
+					// border and make all content appear blank. Treat bare CR progress
+					// updates as line breaks too. Handle CRLF split across chunk boundaries.
+					let text = chunk.toString("utf8");
+					if (job.pendingCarriageReturn) {
+						if (text.startsWith("\n")) text = text.slice(1);
+						job.pendingCarriageReturn = false;
+					}
+					job.pendingCarriageReturn = text.endsWith("\r");
+					job.output += text.replace(/\r\n?/g, "\n");
 					if (job.output.length > BG_MAX_BUFFER_CHARS) {
 						const dropped = job.output.length - BG_MAX_BUFFER_CHARS;
 						job.output = job.output.slice(dropped);
@@ -566,6 +583,10 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 					job.endedAt = Date.now();
 					annotate?.();
 					if (job.timer) clearTimeout(job.timer);
+					// The session may already be gone: reap() kills the tree synchronously,
+					// but the close event arrives on a later tick, after session_shutdown
+					// has run — notifying then would leak into the next session.
+					if (shutdown) return;
 					// An in-flight `wait` observes the exit and returns it directly;
 					// a finished notification on top would be redundant.
 					const observed = job.waiters > 0;
@@ -598,8 +619,9 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 			// the final cwd. Background jobs bypass the chain (they never
 			// touch currentCwd).
 			const timeoutSec = params.timeout ?? FG_DEFAULT_TIMEOUT_SEC;
-			const exec = () =>
-				new Promise<ReturnType<typeof textResult>>((resolve, reject) => {
+			const exec = () => {
+				if (signal?.aborted) return Promise.reject(new Error("command aborted"));
+				return new Promise<ReturnType<typeof textResult>>((resolve, reject) => {
 					const proc = spawn(shell!, shellArgs(UTF8_PRELUDE + params.command + FG_SUFFIX), {
 						cwd,
 						windowsHide: true,
@@ -662,6 +684,7 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 						resolve(textResult(text || "(no output)"));
 					});
 				});
+			};
 			return await new Promise<ReturnType<typeof textResult>>((resolve, reject) => {
 				const queued = foregroundChain.then(exec);
 				foregroundChain = queued.then(

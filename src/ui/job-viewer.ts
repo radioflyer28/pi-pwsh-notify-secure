@@ -186,7 +186,9 @@ export class JobViewer implements Component {
 	private buildContentLines(width: number): string[] {
 		if (width <= 0) return [];
 		const th = this.theme;
-		const out = this.job.output;
+		// The live buffer is normalized on write, but keep the overlay safe when
+		// rendering a legacy or externally-created job with Windows CRLF output.
+		const out = this.job.output.replace(/\r\n?/g, "\n");
 		if (!out.trim()) {
 			return [th.fg("dim", "(no output yet)")];
 		}

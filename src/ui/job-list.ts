@@ -313,7 +313,7 @@ export class JobList {
 
 		const hint = this.active
 			? "↑↓ select · enter view · esc back"
-			: "→ for jobs · ↓ to manage";
+			: "→ / Tab for jobs";
 		const lines: string[] = [];
 		lines.push(truncateToWidth("  " + theme.fg("dim", hint), width));
 		lines.push("");

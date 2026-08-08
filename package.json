@@ -1,6 +1,6 @@
 {
   "name": "pi-pwsh-notify",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "pi extension: PowerShell 7 shell for Windows with Claude Code-style background jobs — completion/server-ready notifications steered to the agent mid-turn (batched, never stale), blocking wait (Monitor-style), no polling, persistent cd",
   "type": "module",
   "license": "MIT",
