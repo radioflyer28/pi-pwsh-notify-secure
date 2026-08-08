@@ -65,7 +65,8 @@ Two tools, Claude Code-shaped: background execution is a parameter, not a separa
 - `pwsh_job` output is **incremental**: each check returns only output produced since the previous one — repeated peeks don't re-burn tokens
 - **`pwsh_job wait`** — Claude Code's Monitor tool: blocks until the job's unseen output matches a `pattern` regex, or the job exits, or `timeout` seconds pass (default 120). The one legitimate way to *wait* for a job when the agent cannot proceed without the result — replaces polling loops entirely
 - Optional `timeout` to kill runaway jobs; jobs killed via `pwsh_job` do not notify
-- Surviving jobs are reaped when pi exits — including **closing the terminal window** (SIGHUP/SIGBREAK/SIGTERM are handled, not just graceful exit), so no invisible orphan dev servers keep listening on their ports
+- **Job viewer (Claude Code style)** — while jobs run, a live list sits below the input box: press `→` (or `Tab`) at an empty prompt to focus it, `↑`/`↓` to select a job, `Enter` to open its **live output overlay** (scrollable, auto-follows new output, `PgUp`/`PgDn`/`Home`/`End`), and press `x` twice to **kill the job** from the overlay. (`↓`/`←` are intentionally left to pi-subagents' fleet view, so both lists can be shown and entered at once)
+- Jobs belong to the session: they are reaped when it ends — pi exiting (including **closing the terminal window**: SIGHUP/SIGBREAK/SIGTERM are handled, not just graceful exit), `/reload`, or switching sessions (`/new`, `/resume`, `/fork`) — so no invisible orphan dev servers keep listening on their ports
 
 ## Built-in tool handling
 
@@ -127,7 +128,9 @@ agent 在后台启动构建或 dev server 后可以继续和你对话；进程�
 | `pwsh` | 执行命令（替换内置 `bash`）；`run_in_background: true` 启动后台任务并**在退出时自动通知**，`notify_on` 正则为常驻进程加**就绪通知** |
 | `pwsh_job` | 后台任务管理：增量输出 / **阻塞等待**（对应 Claude Code 的 Monitor：等输出匹配正则或进程退出）/ 列表 / 杀掉整棵进程树 |
 
-前台 `pwsh`：**`cd` 在调用之间持久**（变量/函数不持久，每次都是全新 `pwsh -NoProfile -NonInteractive` 进程）；命令经 `-EncodedCommand` 传递，**嵌套引号永不出错**；强制 UTF-8（含 Python 子进程）；默认 120 秒超时并清理整棵进程树；结尾 `&` 会被拦截并提示改用后台参数（PowerShell job 会随宿主进程静默死亡）。`pwsh_job` 的输出是**增量的**——每次只返回上次检查之后的新输出，反复查看不重复烧 token；确实需要等结果才能继续时用 `wait`（pattern + timeout）阻塞等待，彻底取代轮询。pi 退出时残留的后台任务会被统一回收——包括**直接关掉终端窗口**（处理了 SIGHUP/SIGBREAK/SIGTERM，不只是正常退出），不留孤儿 dev server 占着端口。
+前台 `pwsh`：**`cd` 在调用之间持久**（变量/函数不持久，每次都是全新 `pwsh -NoProfile -NonInteractive` 进程）；命令经 `-EncodedCommand` 传递，**嵌套引号永不出错**；强制 UTF-8（含 Python 子进程）；默认 120 秒超时并清理整棵进程树；结尾 `&` 会被拦截并提示改用后台参数（PowerShell job 会随宿主进程静默死亡）。`pwsh_job` 的输出是**增量的**——每次只返回上次检查之后的新输出，反复查看不重复烧 token；确实需要等结果才能继续时用 `wait`（pattern + timeout）阻塞等待，彻底取代轮询。
+
+有任务在跑时，输入框下方会出现一个**可进入的任务列表**（Claude Code 风格）：空提示符按 `→`（或 `Tab`）进入，`↑`/`↓` 选择任务，`Enter` 打开**实时输出面板**——可滚动、自动跟随新输出（`PgUp`/`PgDn`/`Home`/`End`），在面板里连按两次 `x` 直接**杀掉任务**。（`↓`/`←` 故意留给 pi-subagents 的 fleet 列表，两个列表可以同时显示、各自进入。）任务属于当前会话：会话结束时（pi 退出——包括**直接关掉终端窗口**，SIGHUP/SIGBREAK/SIGTERM 都已处理；或 `/reload`、`/new`、`/resume`、`/fork` 切换会话）残留任务会被统一回收，不留孤儿 dev server 占着端口。
 
 ### 要求
 

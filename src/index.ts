@@ -31,6 +31,7 @@ import { existsSync } from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
+import { JobList, type JobListUICtx } from "./ui/job-list.js";
 
 const FG_DEFAULT_TIMEOUT_SEC = 120;
 const FG_MAX_RESULT_CHARS = 50_000;
@@ -72,7 +73,7 @@ const SPAWN_ENV = {
 	FORCE_COLOR: "0",
 };
 
-interface BgJob {
+export interface BgJob {
 	id: string;
 	name?: string;
 	command: string;
@@ -95,6 +96,9 @@ interface BgJob {
 	/** Number of pending `wait` calls. While > 0 the exit is being observed
 	 * synchronously, so the finished notification is suppressed. */
 	waiters: number;
+	/** Serializes cursor consumption so concurrent output/wait calls never
+	 * split or steal each other's "new output". */
+	mutex: Promise<void>;
 }
 
 function findShell(): string {
@@ -157,6 +161,21 @@ function textResult(text: string) {
 	return { content: [{ type: "text" as const, text }], details: undefined };
 }
 
+/** Atomically read-and-advance a job's output cursor. Concurrent output/wait
+ * calls queue on job.mutex so none of them splits another's "new output". */
+function consumeCursor(job: BgJob): Promise<string> {
+	const next = job.mutex.then(() => {
+		const fresh = job.output.slice(job.cursor);
+		job.cursor = job.output.length;
+		return fresh;
+	});
+	job.mutex = next.then(
+		() => undefined,
+		() => undefined,
+	);
+	return next;
+}
+
 function ellipsize(text: string, n: number): string {
 	return text.length <= n ? text : `${text.slice(0, n - 1)}…`;
 }
@@ -196,6 +215,15 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 	let currentCwd: string | undefined;
 	const jobs = new Map<string, BgJob>();
 	let jobCounter = 0;
+	// Claude Code-style job list + viewer: →/Tab at an empty prompt enters the
+	// list, Enter opens a job's live output overlay, x twice kills it. (↓/← are
+	// left to pi-subagents' fleet view so both lists can coexist.)
+	const jobList = new JobList(jobs, (job) => {
+		job.killedByTool = true;
+		if (job.proc.pid) killTree(job.proc.pid);
+	});
+	// Foreground pwsh calls serialize here (see the foreground branch below).
+	let foregroundChain: Promise<void> = Promise.resolve();
 
 	// ------------------------------------------------------------------
 	// Footer status: "1 bg job running" while background jobs are alive,
@@ -206,6 +234,7 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 	let uiCtx: Pick<ExtensionContext, "hasUI" | "ui"> | undefined;
 
 	function updateRunningStatus(): void {
+		jobList.update();
 		if (!uiCtx?.hasUI) return;
 		let n = 0;
 		for (const j of jobs.values()) if (j.running) n++;
@@ -216,6 +245,12 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 	pi.on("session_start", (_event, ctx) => {
 		uiCtx = ctx;
 		updateRunningStatus();
+	});
+	// Full UI context (widgets, terminal input, overlays) is only available
+	// during tool execution; the job list registers its widget + key handler here.
+	pi.on("tool_execution_start", (_event, ctx) => {
+		uiCtx = ctx;
+		jobList.setUICtx(ctx.ui as unknown as JobListUICtx);
 	});
 
 	// ------------------------------------------------------------------
@@ -361,13 +396,33 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 			}
 		}
 	};
+	// Signal handlers are the fallback for hard terminal closes (SIGHUP on
+	// console close, ctrl+break SIGBREAK), where pi's graceful path may not
+	// run. reap() is synchronous (taskkill), so it fits in the console-close
+	// grace window; the deferred process.exit(0) gives pi's own shutdown
+	// handlers a chance to run first instead of preempting them.
+	const SIGNALS = ["SIGHUP", "SIGBREAK", "SIGTERM"] as const;
+	const onSignal = () => {
+		reap();
+		setTimeout(() => process.exit(0), 500).unref?.();
+	};
 	process.on("exit", reap);
-	for (const sig of ["SIGHUP", "SIGBREAK", "SIGTERM"] as const) {
-		process.on(sig, () => {
-			reap();
-			process.exit(0);
-		});
-	}
+	for (const sig of SIGNALS) process.on(sig, onSignal);
+	// Session teardown (quit, reload, /new, /resume, /fork): kill the jobs —
+	// they belong to this session and a fresh extension instance cannot take
+	// them over — and unregister everything registered above so repeated
+	// reloads don't accumulate listeners, timers, or widgets.
+	pi.on("session_shutdown", () => {
+		reap();
+		process.off("exit", reap);
+		for (const sig of SIGNALS) process.off(sig, onSignal);
+		jobList.dispose();
+		if (flushTimer) {
+			clearTimeout(flushTimer);
+			flushTimer = undefined;
+		}
+		pending.length = 0;
+	});
 
 	function notifyFinished(job: BgJob): void {
 		const dur = fmtDuration((job.endedAt ?? Date.now()) - job.startedAt);
@@ -475,6 +530,7 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 					readyNotified: false,
 					watchers: new Set(),
 					waiters: 0,
+					mutex: Promise.resolve(),
 				};
 				const append = (chunk: Buffer) => {
 					job.output += chunk.toString("utf8");
@@ -537,69 +593,82 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 			}
 
 			// ---------- foreground ----------
+			// Foreground calls serialize on a promise chain: cd persistence is
+			// session-wide state, so concurrent foreground calls would race on
+			// the final cwd. Background jobs bypass the chain (they never
+			// touch currentCwd).
 			const timeoutSec = params.timeout ?? FG_DEFAULT_TIMEOUT_SEC;
-			return await new Promise((resolve, reject) => {
-				const proc = spawn(shell!, shellArgs(UTF8_PRELUDE + params.command + FG_SUFFIX), {
-					cwd,
-					windowsHide: true,
-					stdio: ["ignore", "pipe", "pipe"],
-					env: { ...process.env, ...SPAWN_ENV },
+			const exec = () =>
+				new Promise<ReturnType<typeof textResult>>((resolve, reject) => {
+					const proc = spawn(shell!, shellArgs(UTF8_PRELUDE + params.command + FG_SUFFIX), {
+						cwd,
+						windowsHide: true,
+						stdio: ["ignore", "pipe", "pipe"],
+						env: { ...process.env, ...SPAWN_ENV },
+					});
+					let out = "";
+					let timedOut = false;
+					let aborted = false;
+					const timer =
+						timeoutSec > 0
+							? setTimeout(() => {
+									timedOut = true;
+									if (proc.pid) killTree(proc.pid);
+								}, timeoutSec * 1000)
+							: undefined;
+					const onAbort = () => {
+						aborted = true;
+						if (proc.pid) killTree(proc.pid);
+					};
+					signal?.addEventListener("abort", onAbort, { once: true });
+					const append = (chunk: Buffer) => {
+						out += chunk.toString("utf8");
+						onUpdate?.(textResult(tailChars(out, FG_LIVE_PREVIEW_CHARS)));
+					};
+					proc.stdout?.on("data", append);
+					proc.stderr?.on("data", append);
+					const cleanup = () => {
+						if (timer) clearTimeout(timer);
+						signal?.removeEventListener("abort", onAbort);
+					};
+					proc.on("error", (err) => {
+						cleanup();
+						reject(err);
+					});
+					proc.on("close", (code) => {
+						cleanup();
+						const notes: string[] = [];
+						// Extract the cwd marker line (absent if the command exited early).
+						let text = out;
+						const mi = text.lastIndexOf(CWD_MARKER);
+						if (mi >= 0) {
+							const le = text.indexOf("\n", mi);
+							const dir = text.slice(mi + CWD_MARKER.length, le === -1 ? undefined : le).trim();
+							text = text.slice(0, mi) + (le === -1 ? "" : text.slice(le + 1));
+							if (dir && dir !== cwd) notes.push(`cwd is now ${dir}`);
+							if (dir) currentCwd = dir;
+						}
+						text = text.trim();
+						if (text.length > FG_MAX_RESULT_CHARS) {
+							text = `[output truncated, showing tail]\n${tailChars(text, FG_MAX_RESULT_CHARS)}`;
+						}
+						if (timedOut)
+							notes.push(
+								`command timed out after ${timeoutSec}s and was killed. If this is a dev server or watcher, rerun with run_in_background: true`,
+							);
+						else if (aborted) notes.push("command aborted");
+						else if (code !== 0) notes.push(`exit code: ${code}`);
+						if (notes.length > 0) text = text ? `${text}\n\n${notes.join("; ")}` : notes.join("; ");
+						resolve(textResult(text || "(no output)"));
+					});
 				});
-				let out = "";
-				let timedOut = false;
-				let aborted = false;
-				const timer =
-					timeoutSec > 0
-						? setTimeout(() => {
-								timedOut = true;
-								if (proc.pid) killTree(proc.pid);
-							}, timeoutSec * 1000)
-						: undefined;
-				const onAbort = () => {
-					aborted = true;
-					if (proc.pid) killTree(proc.pid);
-				};
-				signal?.addEventListener("abort", onAbort, { once: true });
-				const append = (chunk: Buffer) => {
-					out += chunk.toString("utf8");
-					onUpdate?.(textResult(tailChars(out, FG_LIVE_PREVIEW_CHARS)));
-				};
-				proc.stdout?.on("data", append);
-				proc.stderr?.on("data", append);
-				const cleanup = () => {
-					if (timer) clearTimeout(timer);
-					signal?.removeEventListener("abort", onAbort);
-				};
-				proc.on("error", (err) => {
-					cleanup();
-					reject(err);
-				});
-				proc.on("close", (code) => {
-					cleanup();
-					const notes: string[] = [];
-					// Extract the cwd marker line (absent if the command exited early).
-					let text = out;
-					const mi = text.lastIndexOf(CWD_MARKER);
-					if (mi >= 0) {
-						const le = text.indexOf("\n", mi);
-						const dir = text.slice(mi + CWD_MARKER.length, le === -1 ? undefined : le).trim();
-						text = text.slice(0, mi) + (le === -1 ? "" : text.slice(le + 1));
-						if (dir && dir !== cwd) notes.push(`cwd is now ${dir}`);
-						if (dir) currentCwd = dir;
-					}
-					text = text.trim();
-					if (text.length > FG_MAX_RESULT_CHARS) {
-						text = `[output truncated, showing tail]\n${tailChars(text, FG_MAX_RESULT_CHARS)}`;
-					}
-					if (timedOut)
-						notes.push(
-							`command timed out after ${timeoutSec}s and was killed. If this is a dev server or watcher, rerun with run_in_background: true`,
-						);
-					else if (aborted) notes.push("command aborted");
-					else if (code !== 0) notes.push(`exit code: ${code}`);
-					if (notes.length > 0) text = text ? `${text}\n\n${notes.join("; ")}` : notes.join("; ");
-					resolve(textResult(text || "(no output)"));
-				});
+			return await new Promise<ReturnType<typeof textResult>>((resolve, reject) => {
+				const queued = foregroundChain.then(exec);
+				foregroundChain = queued.then(
+					() => undefined,
+					() => undefined,
+				);
+				queued.then(resolve, reject);
 			});
 		},
 	});
@@ -706,8 +775,7 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 					signal?.addEventListener("abort", onAbort, { once: true });
 					check(); // the condition may already hold (buffered match / already exited)
 				});
-				const fresh = job.output.slice(job.cursor);
-				job.cursor = job.output.length;
+				const fresh = await consumeCursor(job);
 				const dur = fmtDuration((job.endedAt ?? Date.now()) - job.startedAt);
 				const head =
 					outcome === "matched"
@@ -722,8 +790,7 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 			}
 			// action === "output": incremental since the previous check
 			const n = params.lines ?? 100;
-			const fresh = job.output.slice(job.cursor);
-			job.cursor = job.output.length;
+			const fresh = await consumeCursor(job);
 			const body = n === 0 ? job.output : tailLines(fresh, n);
 			const dur = fmtDuration((job.endedAt ?? Date.now()) - job.startedAt);
 			const head = `${job.id} — ${statusOf(job)}, ${job.running ? "running for" : "ran"} ${dur}${
