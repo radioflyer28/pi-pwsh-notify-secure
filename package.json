@@ -1,17 +1,20 @@
 {
-  "name": "pi-pwsh-notify",
-  "version": "0.4.2",
-  "description": "pi extension: PowerShell 7 shell for Windows with Claude Code-style background jobs — completion/server-ready notifications steered to the agent mid-turn (batched, never stale), blocking wait (Monitor-style), no polling, persistent cd",
+  "name": "pi-pwsh-notify-secure",
+  "version": "0.4.2-secure.1",
+  "description": "Security-hardened private fork of pi-pwsh-notify: absolute executable resolution and metadata-only background notifications",
   "type": "module",
+  "scripts": {
+    "test": "node --test tests/*.test.ts"
+  },
   "license": "MIT",
-  "author": "oversk7",
+  "author": "oversk7 (upstream)",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/oversk7/pi-pwsh-notify.git"
+    "url": "git+https://github.com/radioflyer28/pi-pwsh-notify-secure.git"
   },
-  "homepage": "https://github.com/oversk7/pi-pwsh-notify#readme",
+  "homepage": "https://github.com/radioflyer28/pi-pwsh-notify-secure#readme",
   "bugs": {
-    "url": "https://github.com/oversk7/pi-pwsh-notify/issues"
+    "url": "https://github.com/radioflyer28/pi-pwsh-notify-secure/issues"
   },
   "keywords": [
     "pi",
