@@ -3,6 +3,7 @@ import test from "node:test";
 import { win32 } from "node:path";
 import { AUTOMATED_NOTE, jobNotificationMetadata } from "../src/notifications.ts";
 import { findPowerShellExecutable, shellArgs, taskkillExecutable } from "../src/security.ts";
+import { activeToolsWithPwsh } from "../src/tool-selection.ts";
 
 test("PowerShell resolution ignores cwd-relative and empty PATH entries", () => {
 	const attempted: string[] = [];
@@ -66,4 +67,16 @@ test("notification metadata escapes attribute values", () => {
 		notification,
 		'<background-job-ready id="bg-1&quot; command=&quot;evil" status="ready" runtime="1s" />',
 	);
+});
+
+test("the extension removes both built-in shell tools", () => {
+	assert.deepEqual(
+		activeToolsWithPwsh(["read", "bash", "powershell", "pwsh", "pwsh_job", "edit", "write"]),
+		["read", "pwsh", "pwsh_job", "edit", "write"],
+	);
+});
+
+test("grep and find remain available unless pi-fff replaces them", () => {
+	assert.deepEqual(activeToolsWithPwsh(["grep", "find", "read"]), ["grep", "find", "read"]);
+	assert.deepEqual(activeToolsWithPwsh(["grep", "find", "ffgrep", "read"]), ["ffgrep", "read"]);
 });

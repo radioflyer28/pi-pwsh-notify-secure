@@ -1,5 +1,5 @@
 /**
- * pi-pwsh-notify: PowerShell 7 shell for pi on Windows, with Claude Code-style
+ * pi-pwsh-notify-secure: PowerShell 7 shell for pi on Windows, with Claude Code-style
  * background jobs that auto-notify the agent — no polling.
  *
  * Two tools:
@@ -31,9 +31,10 @@ import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { AUTOMATED_NOTE, jobNotificationMetadata } from "./notifications.js";
 import { findPowerShellExecutable, shellArgs, taskkillExecutable } from "./security.js";
+import { activeToolsWithPwsh } from "./tool-selection.js";
 import { JobList, type JobListUICtx } from "./ui/job-list.js";
 
 const FG_DEFAULT_TIMEOUT_SEC = 120;
@@ -330,19 +331,13 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 	// extensions (e.g. pi-claude-style-tools) re-register the default-hidden
 	// built-ins to attach custom renderers, which re-activates them as a side
 	// effect — so pruning must run on every session/agent start, not just once.
-	// bash is always removed (pwsh replaces it); grep/find only when pi-fff's
-	// indexed search tools are present to take over.
+	// bash and native powershell are always removed (pwsh replaces both);
+	// grep/find only when pi-fff's indexed search tools are present to take over.
 	// ------------------------------------------------------------------
 	const prune = () => {
 		const active = pi.getActiveTools();
-		const hide = new Set(["bash"]);
-		if (active.includes("ffgrep") || active.includes("fffind")) {
-			hide.add("grep");
-			hide.add("find");
-		}
-		if (active.some((t) => hide.has(t))) {
-			pi.setActiveTools(active.filter((t) => !hide.has(t)));
-		}
+		const next = activeToolsWithPwsh(active);
+		if (next.length !== active.length) pi.setActiveTools(next);
 	};
 	pi.on("session_start", prune);
 	pi.on("agent_start", prune);

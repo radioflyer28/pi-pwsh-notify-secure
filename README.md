@@ -7,15 +7,17 @@ English | [中文说明](#中文说明)
 PowerShell 7 shell for [pi](https://pi.dev) on Windows, with **Claude Code-style background jobs that auto-notify the agent on completion** — no polling.
 
 ```
-pi install git:github.com/radioflyer28/pi-pwsh-notify-secure@v0.4.2-secure.1
+pi install git:github.com/radioflyer28/pi-pwsh-notify-secure@v0.4.2-secure.2
 ```
 
 ## Why
 
-Two problems with running pi on Windows:
+Pi 0.84.3 includes an optional native `powershell` tool for ordinary foreground commands. This package remains focused on two gaps:
 
-1. The built-in `bash` tool runs through Git Bash (MSYS), which mangles Windows paths, garbles non-ASCII output, and **hangs the whole session** on background processes (`npm run dev &`).
-2. Even with a PowerShell extension, existing packages make the agent *poll* for background job status. There is no way for a finished job to wake the agent up.
+1. Native Pi has no managed background jobs, persistent `cd`, blocking job wait, or ready/finished steering notifications.
+2. Pi 0.84.3 resolves PowerShell with unqualified `where` and cleans process trees with unqualified `taskkill`; this fork uses verified absolute executable paths and does not force `-ExecutionPolicy Bypass`.
+
+See the [source-by-source Pi 0.84.3 comparison](docs/research/pi-0.84.3-native-powershell.md) for the full capability and security analysis.
 
 ### Symptoms this fixes
 
@@ -72,25 +74,27 @@ Two tools, Claude Code-shaped: background execution is a parameter, not a separa
 
 ## Built-in tool handling
 
-- Built-in `bash` is removed from the active tool list (pwsh replaces it).
+- Built-in `bash` and Pi 0.84.3's native `powershell` are removed from the active tool list (`pwsh` replaces both), preventing the model from selecting two competing PowerShell implementations.
+- Pi's `!` and `!!` editor shortcuts still use Bash; active-tool pruning changes only the tools exposed to the model.
 - Built-in `grep`/`find` are removed **only when** [pi-fff](https://www.npmjs.com/package/@ff-labs/pi-fff)'s `ffgrep`/`fffind` are present to take over searching. Without pi-fff, nothing else is touched.
 - Removal re-runs on every session/agent start, so it also covers renderer extensions (e.g. pi-claude-style-tools) that re-register the default-hidden built-ins as a side effect.
 
 ## Comparison
 
-| | pi-pwsh-notify | @4fu/pi-pwsh | pi-powershell | @marcfargas/pi-powershell |
-| --- | --- | --- | --- | --- |
-| Foreground PowerShell | ✅ | ✅ | translation layer over bash | ✅ (adds tool) |
-| Background jobs | ✅ | via `Start-Job` | user commands only | ✅ |
-| **Agent auto-notified on completion** | ✅ | ❌ (agent must poll) | ❌ | ❌ (agent must poll) |
-| **Ready notification for never-exiting servers** (`notify_on`) | ✅ | ❌ | ❌ | ❌ |
-| **Mid-turn delivery + batching** (steered before the next LLM call; co-finishers merged into one message) | ✅ | ❌ | ❌ | ❌ |
-| **Blocking wait on pattern/exit** (Claude Code's Monitor) | ✅ | ❌ | ❌ | ❌ |
-| `cd` persists between calls | ✅ | ❌ | ❌ | ❌ |
+| | pi-pwsh-notify-secure | Pi 0.84.3 native | @4fu/pi-pwsh | pi-powershell | @marcfargas/pi-powershell |
+| --- | --- | --- | --- | --- | --- |
+| Foreground PowerShell | ✅ | ✅ | ✅ | translation layer over bash | ✅ (adds tool) |
+| Background jobs | ✅ | ❌ | via `Start-Job` | user commands only | ✅ |
+| **Agent auto-notified on completion** | ✅ (metadata only) | ❌ | ❌ (agent must poll) | ❌ | ❌ (agent must poll) |
+| **Ready notification for never-exiting servers** (`notify_on`) | ✅ | ❌ | ❌ | ❌ | ❌ |
+| **Mid-turn delivery + batching** (steered before the next LLM call; co-finishers merged into one message) | ✅ | ❌ | ❌ | ❌ | ❌ |
+| **Blocking wait on pattern/exit** (Claude Code's Monitor) | ✅ | ❌ | ❌ | ❌ | ❌ |
+| `cd` persists between calls | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Absolute PowerShell / `taskkill.exe` resolution | ✅ | ❌ | — | — | — |
 
 ## Requirements
 
-- Windows. PowerShell 7 (`pwsh`) recommended — install with `winget install Microsoft.PowerShell`. Falls back to Windows PowerShell 5.1 if pwsh is not found.
+- Pi 0.84.3 or newer on Windows. PowerShell 7 (`pwsh`) recommended — install with `winget install Microsoft.PowerShell`. Falls back to Windows PowerShell 5.1 if pwsh is not found.
 
 ## Security hardening
 
@@ -110,7 +114,7 @@ Two tools, Claude Code-shaped: background execution is a parameter, not a separa
 Windows 下给 [pi](https://pi.dev) 用的 PowerShell 7 shell，带 Claude Code 风格的后台任务：**任务结束后自动通知 agent，无需轮询**。
 
 ```
-pi install git:github.com/radioflyer28/pi-pwsh-notify-secure@v0.4.2-secure.1
+pi install git:github.com/radioflyer28/pi-pwsh-notify-secure@v0.4.2-secure.2
 ```
 
 ### 它解决的问题
@@ -142,7 +146,7 @@ agent 在后台启动构建或 dev server 后可以继续和你对话；进程�
 
 ### 要求
 
-Windows。建议 PowerShell 7（`winget install Microsoft.PowerShell`），未安装则回退到 Windows PowerShell 5.1。
+Pi 0.84.3 或更高版本，运行于 Windows。建议 PowerShell 7（`winget install Microsoft.PowerShell`），未安装则回退到 Windows PowerShell 5.1。
 
 ## License
 
