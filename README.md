@@ -1,23 +1,23 @@
 # pi-pwsh-notify-secure
 
-Security-hardened private fork of [oversk7/pi-pwsh-notify](https://github.com/oversk7/pi-pwsh-notify), based on upstream 0.4.2 (`00aec58`).
+Security-hardened private fork of [oversk7/pi-pwsh-notify](https://github.com/oversk7/pi-pwsh-notify). Release `0.5.0-secure.1` selectively adapts upstream 0.5.0 reliability work without adopting its weaker executable resolution, execution-policy override, automatic output disclosure, or default complete-output logs.
 
 English | [中文说明](#中文说明)
 
-PowerShell 7 shell for [pi](https://pi.dev) on Windows, with **Claude Code-style background jobs that auto-notify the agent on completion** — no polling.
+Trusted PowerShell shell for [pi](https://pi.dev) on Windows (PowerShell 7 preferred, Windows PowerShell fallback), with **Claude Code-style background jobs that auto-notify the agent on completion** — no polling.
 
 ```
-pi install git:github.com/radioflyer28/pi-pwsh-notify-secure@v0.4.2-secure.2
+pi install git:github.com/radioflyer28/pi-pwsh-notify-secure@v0.5.0-secure.1
 ```
 
 ## Why
 
-Pi 0.84.3 includes an optional native `powershell` tool for ordinary foreground commands. This package remains focused on two gaps:
+Pi 0.84.3 introduced an optional native `powershell` tool for ordinary foreground commands. This package remains focused on two gaps:
 
 1. Native Pi has no managed background jobs, persistent `cd`, blocking job wait, or ready/finished steering notifications.
-2. Pi 0.84.3 resolves PowerShell with unqualified `where` and cleans process trees with unqualified `taskkill`; this fork uses verified absolute executable paths and does not force `-ExecutionPolicy Bypass`.
+2. The native implementation examined at Pi 0.84.3 used unqualified executable discovery and cleanup helpers; this fork uses verified absolute executable paths and does not force `-ExecutionPolicy Bypass`.
 
-See the [source-by-source Pi 0.84.3 comparison](docs/research/pi-0.84.3-native-powershell.md) for the full capability and security analysis.
+The peer floor remains Pi/TUI 0.84.3 after type-checking against that release. Development, integration tests, and extension smoke loading target Pi/TUI 0.87.1. See the [source-by-source Pi comparison](docs/research/pi-0.84.3-native-powershell.md) and the [upstream 0.5.0 secure-adaptation matrix](docs/research/upstream-0.5.0-secure-adaptation.md).
 
 ### Symptoms this fixes
 
@@ -35,8 +35,8 @@ Delivery also mirrors Claude Code's mechanics, built on pi's official steering c
 
 - **Agent mid-turn** → pi injects the notification **before the agent's next LLM call**, so the model learns "server is up" or "job failed" within seconds, while it is still working — instead of receiving stale news after the turn ends (`followUp`), when it has often already discovered (and handled) the outcome itself.
 - **Agent idle** → `triggerTurn` wakes it immediately.
-- **Batching** → job events are debounced (250 ms) and merged into **one message**. This matters because pi's steering queue drains one message per LLM call: without merging, N jobs finishing together would cost N calls.
-- A job that exits while a `pwsh_job wait` is blocked on it is reported by the wait's own return value; the redundant finished notification is suppressed.
+- **Bounded batching and retries** → job events are debounced (250 ms), split into bounded item/character batches, retried only a finite number of times, and reported locally if delivery is ultimately dropped.
+- A ready or finished state explicitly observed through `pwsh_job output`/`wait` cancels the matching queued notification, preventing redundant model turns.
 
 Because notifications are *custom* messages/entries rather than fake user messages, the TUI shows a compact one-line status row instead of a wall of text in a `User` box. The LLM receives only the job id, status, and runtime; it must retrieve output explicitly when relevant.
 
@@ -52,16 +52,16 @@ Two tools, Claude Code-shaped: background execution is a parameter, not a separa
 ### Foreground `pwsh`
 
 - **`cd` persists between calls** (tracked by the extension); variables and functions do not — each call is a fresh `pwsh -NoProfile -NonInteractive` process
-- Commands are passed via `-EncodedCommand` — **nested quoting never breaks**
-- UTF-8 forced on both PowerShell and Python child processes — non-ASCII output renders correctly
+- Commands are transported as BOM-less UTF-8 over stdin through a fixed bootstrap, avoiding Windows command-line length and quoting limits
+- Per-stream UTF-8 decoders preserve multibyte characters split across process chunks; CRLF and bare carriage returns are normalized before TUI/model output
 - Default 120s timeout (overridable per call); the whole process **tree** is killed on timeout, with a hint to rerun with `run_in_background` if it looks like a server
 - A trailing `&` is rejected with a pointer to `run_in_background` — a PowerShell job would die silently with the wrapper process
-- Native exit codes survive the `-Command` flattening (`exit $LASTEXITCODE` re-raise)
-- Live output streaming while the command runs
+- Final native exit codes and PowerShell cmdlet failures are reported correctly, while a later successful operation clears stale failure state
+- Foreground results use Pi's standard byte/line limits; live output streams while the command runs
 
 ### Background (`run_in_background: true`)
 
-- Returns immediately with a job id; output captured in memory (last 400 KB)
+- Returns immediately with a job id; output stays in a bounded in-memory tail (last 400 KB) with absolute cursors and explicit warnings if unseen data rolls out
 - On exit, a metadata-only `<background-job-finished>` notification (job id, status, runtime) is injected into the session; command and output text are intentionally omitted
 - **`notify_on` regex** — for processes that never exit (dev servers, watchers): the first output match injects a one-time metadata-only `<background-job-ready>` notification, so "server is up" also arrives without polling (e.g. `notify_on: "Local:.*http"` for vite)
 - Rendered in the TUI as a single status row — `● bg job bg-1 (pytest) · exited 0 · 7s`; inspect output explicitly through `pwsh_job` or the job viewer
@@ -70,12 +70,14 @@ Two tools, Claude Code-shaped: background execution is a parameter, not a separa
 - **`pwsh_job wait`** — Claude Code's Monitor tool: blocks until the job's unseen output matches a `pattern` regex, or the job exits, or `timeout` seconds pass (default 120). The one legitimate way to *wait* for a job when the agent cannot proceed without the result — replaces polling loops entirely
 - Optional `timeout` to kill runaway jobs; jobs killed via `pwsh_job` do not notify
 - **Job viewer (Claude Code style)** — while jobs run, a live list sits below the input box: press `→` (or `Tab`) at an empty prompt to focus it, `↑`/`↓` to select a job, `Enter` to open its **live output overlay** (scrollable, auto-follows new output, `PgUp`/`PgDn`/`Home`/`End`), and press `x` twice to **kill the job** from the overlay. (`↓`/`←` are intentionally left to pi-subagents' fleet view, so both lists can be shown and entered at once)
-- Jobs belong to the session: they are reaped when it ends — pi exiting (including **closing the terminal window**: SIGHUP/SIGBREAK/SIGTERM are handled, not just graceful exit), `/reload`, or switching sessions (`/new`, `/resume`, `/fork`) — so no invisible orphan dev servers keep listening on their ports
+- Jobs belong to the session: they are reaped when it ends — pi exiting (including **closing the terminal window**: SIGHUP/SIGBREAK/SIGTERM are handled, not just graceful exit), `/reload`, or switching sessions (`/new`, `/resume`, `/fork`) — and shutdown waits only for a bounded settlement interval
+- Complete command output is **not written to temporary or persistent log files by default**; output is available only through explicit bounded tool results, the live viewer, and the in-memory tail
 
 ## Built-in tool handling
 
-- Built-in `bash` and Pi 0.84.3's native `powershell` are removed from the active tool list (`pwsh` replaces both), preventing the model from selecting two competing PowerShell implementations.
-- Pi's `!` and `!!` editor shortcuts still use Bash; active-tool pruning changes only the tools exposed to the model.
+- When a trusted runtime is available, built-in `bash` and native `powershell` are removed from the active tool list (`pwsh` replaces both), preventing competing shell surfaces.
+- Pi's `!` and `!!` editor shortcuts execute through the same trusted PowerShell runtime and persistent working directory.
+- If no trusted PowerShell runtime is available, `pwsh`/`pwsh_job` are deactivated and Pi's built-in shell tools remain available.
 - Built-in `grep`/`find` are removed **only when** [pi-fff](https://www.npmjs.com/package/@ff-labs/pi-fff)'s `ffgrep`/`fffind` are present to take over searching. Without pi-fff, nothing else is touched.
 - Removal re-runs on every session/agent start, so it also covers renderer extensions (e.g. pi-claude-style-tools) that re-register the default-hidden built-ins as a side effect.
 
@@ -94,13 +96,15 @@ Two tools, Claude Code-shaped: background execution is a parameter, not a separa
 
 ## Requirements
 
-- Pi 0.84.3 or newer on Windows. PowerShell 7 (`pwsh`) recommended — install with `winget install Microsoft.PowerShell`. Falls back to Windows PowerShell 5.1 if pwsh is not found.
+- Pi/TUI 0.84.3 or newer on Windows; Pi/TUI 0.87.1 is the development and smoke-test target.
+- PowerShell 7 (`pwsh`) is preferred — install with `winget install Microsoft.PowerShell`. Trusted Windows PowerShell 5.1 is retained as a fallback.
 
 ## Security hardening
 
 - PowerShell and `taskkill.exe` are launched only by verified absolute path. Empty and relative `PATH` entries are ignored, and no `where.exe` subprocess is used, preventing current-directory executable hijacking in untrusted repositories.
-- Automatic ready/finished steering messages contain metadata only. Commands and stdout/stderr must be retrieved explicitly and are identified to the agent as untrusted data.
+- Automatic ready/finished steering messages contain metadata only. Commands, matched lines, stdout/stderr, and log paths are omitted; output must be retrieved explicitly and is identified to the agent as untrusted data.
 - Shells run with `-NoProfile -NonInteractive`; this fork does not force `-ExecutionPolicy Bypass`.
+- No full-output temporary logs are created by default.
 
 ## Notes
 
@@ -114,7 +118,7 @@ Two tools, Claude Code-shaped: background execution is a parameter, not a separa
 Windows 下给 [pi](https://pi.dev) 用的 PowerShell 7 shell，带 Claude Code 风格的后台任务：**任务结束后自动通知 agent，无需轮询**。
 
 ```
-pi install git:github.com/radioflyer28/pi-pwsh-notify-secure@v0.4.2-secure.2
+pi install git:github.com/radioflyer28/pi-pwsh-notify-secure@v0.5.0-secure.1
 ```
 
 ### 它解决的问题
@@ -140,13 +144,13 @@ agent 在后台启动构建或 dev server 后可以继续和你对话；进程�
 | `pwsh` | 执行命令（替换内置 `bash`）；`run_in_background: true` 启动后台任务并**在退出时自动通知**，`notify_on` 正则为常驻进程加**就绪通知** |
 | `pwsh_job` | 后台任务管理：增量输出 / **阻塞等待**（对应 Claude Code 的 Monitor：等输出匹配正则或进程退出）/ 列表 / 杀掉整棵进程树 |
 
-前台 `pwsh`：**`cd` 在调用之间持久**（变量/函数不持久，每次都是全新 `pwsh -NoProfile -NonInteractive` 进程）；命令经 `-EncodedCommand` 传递，**嵌套引号永不出错**；强制 UTF-8（含 Python 子进程）；默认 120 秒超时并清理整棵进程树；结尾 `&` 会被拦截并提示改用后台参数（PowerShell job 会随宿主进程静默死亡）。`pwsh_job` 的输出是**增量的**——每次只返回上次检查之后的新输出，反复查看不重复烧 token；确实需要等结果才能继续时用 `wait`（pattern + timeout）阻塞等待，彻底取代轮询。
+前台 `pwsh`：**`cd` 在调用之间持久**（变量/函数不持久，每次都是全新 `pwsh -NoProfile -NonInteractive` 进程）；命令通过固定 bootstrap 以无 BOM UTF-8 从 stdin 传入，不受 Windows 命令行长度和嵌套引号限制；默认 120 秒超时并清理整棵进程树；结尾 `&` 会被拦截并提示改用后台参数。`pwsh_job` 的输出是**增量且有界的**——每次只返回上次检查之后的新输出，`lines: 0` 也受 Pi 标准字节/行数限制；内存尾部滚动导致未读数据丢失时会明确警告。默认不会把完整命令输出写入临时日志。
 
 有任务在跑时，输入框下方会出现一个**可进入的任务列表**（Claude Code 风格）：空提示符按 `→`（或 `Tab`）进入，`↑`/`↓` 选择任务，`Enter` 打开**实时输出面板**——可滚动、自动跟随新输出（`PgUp`/`PgDn`/`Home`/`End`），在面板里连按两次 `x` 直接**杀掉任务**。（`↓`/`←` 故意留给 pi-subagents 的 fleet 列表，两个列表可以同时显示、各自进入。）任务属于当前会话：会话结束时（pi 退出——包括**直接关掉终端窗口**，SIGHUP/SIGBREAK/SIGTERM 都已处理；或 `/reload`、`/new`、`/resume`、`/fork` 切换会话）残留任务会被统一回收，不留孤儿 dev server 占着端口。
 
 ### 要求
 
-Pi 0.84.3 或更高版本，运行于 Windows。建议 PowerShell 7（`winget install Microsoft.PowerShell`），未安装则回退到 Windows PowerShell 5.1。
+Pi/TUI 0.84.3 或更高版本，运行于 Windows；开发与 smoke test 目标为 0.87.1。建议 PowerShell 7（`winget install Microsoft.PowerShell`），未安装时保留可信的 Windows PowerShell 5.1 回退。`!`/`!!` 也会使用同一安全 PowerShell runtime；若找不到可信 runtime，本扩展工具停用并保留 Pi 内置 shell。
 
 ## License
 

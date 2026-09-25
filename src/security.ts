@@ -1,8 +1,21 @@
+import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { win32 } from "node:path";
 
 type Environment = NodeJS.ProcessEnv;
 type FileExists = (path: string) => boolean;
+
+export const POWERSHELL_RUNTIME_ENV = "PI_PWSH_NOTIFY_EXECUTABLE";
+const PROBE_TIMEOUT_MS = 5_000;
+
+export interface PowerShellRuntime {
+	executable: string;
+	version: string;
+	edition: "Core" | "Desktop";
+	kind: "pwsh" | "windows-powershell";
+}
+
+export type RuntimeProbe = (executable: string, env: Environment) => PowerShellRuntime | undefined;
 
 function unquote(value: string): string {
 	const trimmed = value.trim();
@@ -19,7 +32,16 @@ function absoluteDirectories(value: string | undefined): string[] {
 }
 
 function unique(paths: string[]): string[] {
-	return [...new Set(paths.map((path) => win32.normalize(path)))];
+	const seen = new Set<string>();
+	const result: string[] = [];
+	for (const path of paths) {
+		const normalized = win32.normalize(path);
+		const key = normalized.toLowerCase();
+		if (seen.has(key)) continue;
+		seen.add(key);
+		result.push(normalized);
+	}
+	return result;
 }
 
 /**
@@ -28,22 +50,24 @@ function unique(paths: string[]): string[] {
  */
 export function windowsDirectory(env: Environment = process.env): string {
 	for (const candidate of [env.SystemRoot, env.WINDIR]) {
-		if (candidate) {
-			const directory = unquote(candidate);
-			if (win32.isAbsolute(directory)) return win32.normalize(directory);
-		}
+		if (!candidate) continue;
+		const directory = unquote(candidate);
+		if (win32.isAbsolute(directory)) return win32.normalize(directory);
 	}
 	return String.raw`C:\Windows`;
 }
 
-/**
- * Find PowerShell using only absolute candidates. Relative and empty PATH
- * entries are intentionally ignored because Windows treats them as cwd-based.
- */
-export function findPowerShellExecutable(
-	env: Environment = process.env,
-	fileExists: FileExists = existsSync,
-): string {
+/** Enumerate only absolute PowerShell candidates, in preference order. */
+export function powerShellCandidates(env: Environment = process.env): string[] {
+	const explicitValue = env[POWERSHELL_RUNTIME_ENV]?.trim();
+	if (explicitValue) {
+		const explicit = unquote(explicitValue);
+		if (!win32.isAbsolute(explicit)) {
+			throw new Error(`${POWERSHELL_RUNTIME_ENV} must be an absolute Windows path: ${explicitValue}`);
+		}
+		return [win32.normalize(explicit)];
+	}
+
 	const pathDirectories = absoluteDirectories(env.Path ?? env.PATH);
 	const programRoots = unique(
 		[env.ProgramW6432, env.ProgramFiles, env["ProgramFiles(x86)"]]
@@ -53,27 +77,57 @@ export function findPowerShellExecutable(
 	);
 	const systemRoot = windowsDirectory(env);
 
-	// Prefer PowerShell 7, first in its standard location and then in absolute
-	// PATH entries (which also covers winget, Scoop, and custom installations).
-	const pwshCandidates = unique([
+	return unique([
 		...programRoots.map((root) => win32.join(root, "PowerShell", "7", "pwsh.exe")),
 		...pathDirectories.map((directory) => win32.join(directory, "pwsh.exe")),
-	]);
-	for (const candidate of pwshCandidates) {
-		if (fileExists(candidate)) return candidate;
-	}
-
-	// Windows PowerShell's system location is safer than an arbitrary PATH
-	// entry and is the documented fallback when PowerShell 7 is unavailable.
-	const powershellCandidates = unique([
 		win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
 		...pathDirectories.map((directory) => win32.join(directory, "powershell.exe")),
 	]);
-	for (const candidate of powershellCandidates) {
-		if (fileExists(candidate)) return candidate;
-	}
+}
 
-	throw new Error("Neither PowerShell 7 nor Windows PowerShell was found at a trusted absolute path");
+export function probePowerShellRuntime(executable: string, env: Environment = process.env): PowerShellRuntime | undefined {
+	if (!win32.isAbsolute(executable)) return undefined;
+	const script =
+		"[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); " +
+		"Write-Output ($PSVersionTable.PSEdition + '|' + $PSVersionTable.PSVersion.Major + '|' + $PSVersionTable.PSVersion.ToString())";
+	const result = spawnSync(executable, ["-NoProfile", "-NonInteractive", "-Command", script], {
+		encoding: "utf8",
+		env,
+		timeout: PROBE_TIMEOUT_MS,
+		windowsHide: true,
+	});
+	if (result.status !== 0 || result.error) return undefined;
+	const line = result.stdout.trim().split(/\r?\n/).at(-1) ?? "";
+	const [editionText, majorText, version] = line.split("|");
+	const major = Number(majorText);
+	const edition = editionText === "Core" ? "Core" : editionText === "Desktop" ? "Desktop" : undefined;
+	if (!edition || !Number.isInteger(major) || !version) return undefined;
+	if (edition === "Core" && major < 7) return undefined;
+	if (edition === "Desktop" && major < 5) return undefined;
+	return {
+		executable: win32.normalize(executable),
+		version,
+		edition,
+		kind: edition === "Core" ? "pwsh" : "windows-powershell",
+	};
+}
+
+/** Resolve and probe a supported runtime without unqualified discovery commands. */
+export function findPowerShellRuntime(
+	env: Environment = process.env,
+	fileExists: FileExists = existsSync,
+	probe: RuntimeProbe = probePowerShellRuntime,
+): PowerShellRuntime {
+	for (const candidate of powerShellCandidates(env)) {
+		if (!fileExists(candidate)) continue;
+		const runtime = probe(candidate, env);
+		if (runtime) return runtime;
+	}
+	const configured = env[POWERSHELL_RUNTIME_ENV]?.trim();
+	const hint = configured
+		? `${POWERSHELL_RUNTIME_ENV} points to an unavailable or unsupported PowerShell: ${configured}`
+		: "Install PowerShell 7 with: winget install Microsoft.PowerShell";
+	throw new Error(`No supported PowerShell runtime was found at a trusted absolute path. ${hint}`);
 }
 
 /** Resolve taskkill from the Windows system directory, never from cwd/PATH. */
@@ -86,14 +140,4 @@ export function taskkillExecutable(
 		throw new Error(`Windows taskkill.exe was not found at the trusted system path: ${candidate}`);
 	}
 	return candidate;
-}
-
-/** -EncodedCommand keeps arbitrary quoting intact (no arg-string reparsing). */
-export function shellArgs(script: string): string[] {
-	return [
-		"-NoProfile",
-		"-NonInteractive",
-		"-EncodedCommand",
-		Buffer.from(script, "utf16le").toString("base64"),
-	];
 }

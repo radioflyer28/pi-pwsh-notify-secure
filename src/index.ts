@@ -1,5 +1,5 @@
 /**
- * pi-pwsh-notify-secure: PowerShell 7 shell for pi on Windows, with Claude Code-style
+ * pi-pwsh-notify-secure: trusted PowerShell shell for pi on Windows, with Claude Code-style
  * background jobs that auto-notify the agent — no polling.
  *
  * Two tools:
@@ -23,47 +23,43 @@
  * receives status metadata only; untrusted command/output text stays behind the
  * explicit pwsh_job boundary. The TUI renders a compact status row.
  *
- * Commands are passed via -EncodedCommand (base64 UTF-16LE), so nested quoting
- * never breaks. grep/find built-ins are removed only when pi-fff's
- * ffgrep/fffind are present to take over searching.
+ * Commands are passed through a fixed bootstrap as BOM-less UTF-8 stdin, so
+ * command length and nested quoting do not enter the Windows command line.
+ * grep/find built-ins are removed only when pi-fff replacements are present.
  */
-import { type ChildProcess, spawn, spawnSync } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { resolve as resolvePath } from "node:path";
+import { StringDecoder } from "node:string_decoder";
+import {
+	DEFAULT_MAX_BYTES,
+	DEFAULT_MAX_LINES,
+	formatSize,
+	truncateTail,
+	type BashOperations,
+	type ExtensionAPI,
+	type ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { NotificationQueue, type NotificationKind } from "./notification-queue.js";
 import { AUTOMATED_NOTE, jobNotificationMetadata } from "./notifications.js";
-import { findPowerShellExecutable, shellArgs, taskkillExecutable } from "./security.js";
-import { activeToolsWithPwsh } from "./tool-selection.js";
+import { buildPowerShellScript, killProcessTree, resolvePowerShellRuntime, spawnPowerShell } from "./runtime.js";
+import type { PowerShellRuntime } from "./security.js";
+import { activeToolsForPowerShell } from "./tool-selection.js";
 import { JobList, type JobListUICtx } from "./ui/job-list.js";
 
 const FG_DEFAULT_TIMEOUT_SEC = 120;
-const FG_MAX_RESULT_CHARS = 50_000;
 const FG_LIVE_PREVIEW_CHARS = 4_000;
 const BG_MAX_BUFFER_CHARS = 400_000;
 const WAIT_DEFAULT_TIMEOUT_SEC = 120;
 const WAIT_TAIL_LINES = 100;
-/** Debounce before sending queued notifications, so jobs finishing together
- * are merged into a single message (= a single LLM call) instead of one each. */
-const NOTIFY_BATCH_MS = 250;
 /** customType used for job notifications + their TUI renderer. */
 const NOTIFY_TYPE = "pwsh-bg-notify";
 /** Marker line appended to foreground scripts to report the final $PWD; the
  * leading SOH control char makes collisions with real output practically
  * impossible. */
 const CWD_MARKER = String.fromCharCode(1) + "pwsh-cwd:";
-// BOM-less UTF-8: [System.Text.Encoding]::UTF8 emits a BOM, which corrupts the
-// first chunk piped into native stdin (e.g. `Get-Content key | ssh "cat >> file"`).
-const UTF8_PRELUDE =
-	"$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $ErrorActionPreference = 'Continue'; ";
-// pwsh -Command/-EncodedCommand flattens native exit codes to 0/1 unless
-// re-raised explicitly; the marker line reports the final cwd before re-raising.
-const FG_SUFFIX = `\n$__ec = $LASTEXITCODE; Write-Output ('${CWD_MARKER}' + $PWD.Path); if ($null -ne $__ec) { exit $__ec }`;
-// Background jobs need the same re-raise (so `cmd /c "exit 3"` notifies exit 3,
-// not 1) but no cwd marker — it would pollute the captured output and the
-// notification tail.
-const BG_SUFFIX = `\n$__ec = $LASTEXITCODE; if ($null -ne $__ec) { exit $__ec }`;
-
 const SPAWN_ENV = {
 	PYTHONIOENCODING: "utf-8",
 	PYTHONUTF8: "1",
@@ -79,7 +75,9 @@ export interface BgJob {
 	cwd: string;
 	proc: ChildProcess;
 	output: string;
-	/** Offset into `output` already returned by pwsh_job output/wait. */
+	/** Absolute stream offset represented by output[0]. */
+	baseOffset: number;
+	/** Absolute stream offset already returned by pwsh_job output/wait. */
 	cursor: number;
 	/** A chunk may end between CR and LF; skip that LF on the next chunk. */
 	pendingCarriageReturn: boolean;
@@ -88,6 +86,7 @@ export interface BgJob {
 	endedAt?: number;
 	exitCode: number | null;
 	running: boolean;
+	settling: boolean;
 	killedByTool: boolean;
 	timedOut: boolean;
 	readyNotified: boolean;
@@ -97,18 +96,13 @@ export interface BgJob {
 	/** Number of pending `wait` calls. While > 0 the exit is being observed
 	 * synchronously, so the finished notification is suppressed. */
 	waiters: number;
+	/** Whether an explicit output/wait operation has reported terminal state. */
+	terminalObserved: boolean;
 	/** Serializes cursor consumption so concurrent output/wait calls never
 	 * split or steal each other's "new output". */
 	mutex: Promise<void>;
 }
 
-function findShell(): string {
-	return findPowerShellExecutable();
-}
-
-function killTree(pid: number): void {
-	spawnSync(taskkillExecutable(), ["/PID", String(pid), "/T", "/F"], { windowsHide: true });
-}
 
 /** Trailing `&` creates a PowerShell job that dies with the wrapper process. */
 function rejectTrailingAmpersand(command: string): void {
@@ -135,6 +129,33 @@ function tailChars(text: string, n: number): string {
 	return text.length <= n ? text : text.slice(text.length - n);
 }
 
+function boundedTail(text: string, maxLines = DEFAULT_MAX_LINES): string {
+	const lineBudget = Math.max(1, Math.min(DEFAULT_MAX_LINES - 1, maxLines));
+	const truncation = truncateTail(text, {
+		maxBytes: Math.max(1, DEFAULT_MAX_BYTES - 256),
+		maxLines: lineBudget,
+	});
+	if (!truncation.truncated) return truncation.content;
+	return `[output truncated: showing ${truncation.outputLines} of ${truncation.totalLines} lines, ${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}]\n${truncation.content}`;
+}
+
+function boundedResult(prefix: string, body: string, maxBodyLines = DEFAULT_MAX_LINES): string {
+	const prefixLines = prefix ? prefix.split("\n").length : 0;
+	const byteBudget = Math.max(1, DEFAULT_MAX_BYTES - Buffer.byteLength(prefix, "utf8") - 258);
+	const lineBudget = Math.max(1, Math.min(maxBodyLines, DEFAULT_MAX_LINES - prefixLines - 1));
+	const truncation = truncateTail(body, { maxBytes: byteBudget, maxLines: lineBudget });
+	const marker = truncation.truncated
+		? `[output truncated: showing ${truncation.outputLines} of ${truncation.totalLines} lines, ${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}]`
+		: "";
+	return [prefix, marker, truncation.content].filter(Boolean).join("\n");
+}
+
+function samePath(left: string, right: string): boolean {
+	const a = resolvePath(left);
+	const b = resolvePath(right);
+	return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
 function statusOf(job: BgJob): string {
 	if (job.running) return "running";
 	if (job.timedOut) return "timeout (killed)";
@@ -146,13 +167,19 @@ function textResult(text: string) {
 	return { content: [{ type: "text" as const, text }], details: undefined };
 }
 
-/** Atomically read-and-advance a job's output cursor. Concurrent output/wait
- * calls queue on job.mutex so none of them splits another's "new output". */
-function consumeCursor(job: BgJob): Promise<string> {
+interface CursorRead {
+	text: string;
+	missed: boolean;
+}
+
+/** Atomically read-and-advance an absolute output cursor. */
+function consumeCursor(job: BgJob): Promise<CursorRead> {
 	const next = job.mutex.then(() => {
-		const fresh = job.output.slice(job.cursor);
-		job.cursor = job.output.length;
-		return fresh;
+		const missed = job.cursor < job.baseOffset;
+		const relativeStart = Math.max(0, job.cursor - job.baseOffset);
+		const text = job.output.slice(relativeStart);
+		job.cursor = job.baseOffset + job.output.length;
+		return { text, missed };
 	});
 	job.mutex = next.then(
 		() => undefined,
@@ -182,14 +209,9 @@ interface NotifyBatch {
 	jobs: NotifyDetails[];
 }
 
-/** A queued notification: LLM text block + its TUI row. */
-interface PendingNotify {
-	content: string;
-	details: NotifyDetails;
-}
-
 export default function pwshNotifyExtension(pi: ExtensionAPI) {
-	let shell: string | undefined;
+	let runtime: PowerShellRuntime | undefined;
+	let runtimeError: string | undefined;
 	/** Persisted working directory: cd survives across pwsh calls. */
 	let currentCwd: string | undefined;
 	const jobs = new Map<string, BgJob>();
@@ -198,11 +220,124 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 	// list, Enter opens a job's live output overlay, x twice kills it. (↓/← are
 	// left to pi-subagents' fleet view so both lists can coexist.)
 	const jobList = new JobList(jobs, (job) => {
-		job.killedByTool = true;
-		if (job.proc.pid) killTree(job.proc.pid);
+		try {
+			if (job.proc.pid) killProcessTree(job.proc.pid);
+			job.killedByTool = true;
+		} catch (error) {
+			uiCtx?.ui.notify(`Failed to kill ${job.id}: ${String(error)}`, "error");
+		}
 	});
 	// Foreground pwsh calls serialize here (see the foreground branch below).
 	let foregroundChain: Promise<void> = Promise.resolve();
+
+	function detectRuntime(): PowerShellRuntime | undefined {
+		try {
+			runtime = resolvePowerShellRuntime();
+			runtimeError = undefined;
+			return runtime;
+		} catch (error) {
+			runtime = undefined;
+			runtimeError = error instanceof Error ? error.message : String(error);
+			return undefined;
+		}
+	}
+
+	function requireRuntime(): PowerShellRuntime {
+		const detected = runtime ?? detectRuntime();
+		if (!detected) throw new Error(runtimeError ?? "A trusted PowerShell runtime is unavailable");
+		return detected;
+	}
+
+	function buildToolEnv(ctx: ExtensionContext): NodeJS.ProcessEnv {
+		const env: NodeJS.ProcessEnv = { ...process.env, ...SPAWN_ENV };
+		const set = (name: string, value: string | undefined) => {
+			if (value) env[name] = value;
+			else delete env[name];
+		};
+		try {
+			set("PI_SESSION_ID", ctx.sessionManager.getSessionId());
+			set("PI_SESSION_FILE", ctx.sessionManager.getSessionFile());
+		} catch {
+			set("PI_SESSION_ID", undefined);
+			set("PI_SESSION_FILE", undefined);
+		}
+		set("PI_PROVIDER", ctx.model?.provider);
+		set("PI_MODEL", ctx.model?.id);
+		set("PI_REASONING_LEVEL", ctx.thinkingLevel);
+		return env;
+	}
+
+	function createUserPowerShellOperations(detected: PowerShellRuntime): BashOperations {
+		return {
+			exec(command, cwd, options) {
+				if (currentCwd && !existsSync(currentCwd)) currentCwd = undefined;
+				const startCwd = currentCwd ?? cwd;
+				const proc = spawnPowerShell(
+					detected.executable,
+					buildPowerShellScript(command, CWD_MARKER),
+					{ cwd: startCwd, env: { ...process.env, ...SPAWN_ENV, ...options.env } },
+				);
+				return new Promise<{ exitCode: number | null }>((resolve, reject) => {
+					let settled = false;
+					let timer: NodeJS.Timeout | undefined;
+					let cleanupError: unknown;
+					let output = "";
+					const stdoutDecoder = new StringDecoder("utf8");
+					const stderrDecoder = new StringDecoder("utf8");
+					const stop = () => {
+						if (!proc.pid) return;
+						try {
+							killProcessTree(proc.pid);
+						} catch (error) {
+							cleanupError = error;
+						}
+					};
+					const onAbort = () => stop();
+					if (options.timeout && options.timeout > 0) {
+						timer = setTimeout(stop, options.timeout);
+						timer.unref?.();
+					}
+					options.signal?.addEventListener("abort", onAbort, { once: true });
+					proc.stdout?.on("data", (chunk: Buffer) => { output += stdoutDecoder.write(chunk); });
+					proc.stderr?.on("data", (chunk: Buffer) => { output += stderrDecoder.write(chunk); });
+					proc.stdout?.on("end", () => { output += stdoutDecoder.end(); });
+					proc.stderr?.on("end", () => { output += stderrDecoder.end(); });
+					const cleanup = () => {
+						if (timer) clearTimeout(timer);
+						options.signal?.removeEventListener("abort", onAbort);
+					};
+					proc.on("error", (error) => {
+						if (settled) return;
+						settled = true;
+						cleanup();
+						reject(error);
+					});
+					proc.on("close", (exitCode) => {
+						if (settled) return;
+						settled = true;
+						cleanup();
+						const markerIndex = output.lastIndexOf(CWD_MARKER);
+						if (markerIndex >= 0) {
+							const lineEnd = output.indexOf("\n", markerIndex);
+							const dir = output
+								.slice(markerIndex + CWD_MARKER.length, lineEnd === -1 ? undefined : lineEnd)
+								.trim();
+							output = output.slice(0, markerIndex) + (lineEnd === -1 ? "" : output.slice(lineEnd + 1));
+							if (dir) currentCwd = resolvePath(dir);
+						}
+						if (output) options.onData(Buffer.from(output.replace(/\r\n?/g, "\n"), "utf8"));
+						if (cleanupError) reject(cleanupError);
+						else resolve({ exitCode });
+					});
+				});
+			},
+		};
+	}
+
+	pi.on("user_bash", () => {
+		const detected = runtime ?? detectRuntime();
+		return detected ? { operations: createUserPowerShellOperations(detected) } : undefined;
+	});
 
 	// ------------------------------------------------------------------
 	// Footer status: "1 bg job running" while background jobs are alive,
@@ -242,33 +377,28 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 	// turn); when idle, triggerTurn wakes it. Merging matters because the
 	// steering queue drains one message per LLM call.
 	// ------------------------------------------------------------------
-	const pending: PendingNotify[] = [];
-	let flushTimer: NodeJS.Timeout | undefined;
-
-	function flushNotifications(): void {
-		if (flushTimer) {
-			clearTimeout(flushTimer);
-			flushTimer = undefined;
-		}
-		const batch = pending.splice(0, pending.length);
-		if (batch.length === 0) return;
-		try {
-			// A custom message keeps the LLM payload identical while letting the
-			// TUI show compact status rows.
+	const notifications = new NotificationQueue<NotifyDetails>(
+		(batch) => {
 			pi.sendMessage<NotifyBatch>(
 				{
 					customType: NOTIFY_TYPE,
-					content: [...batch.map((b) => b.content), AUTOMATED_NOTE].join("\n"),
+					content: [...batch.map((item) => item.content), AUTOMATED_NOTE].join("\n"),
 					display: true,
-					details: { jobs: batch.map((b) => b.details) },
+					details: { jobs: batch.map((item) => item.details) },
 				},
 				{ deliverAs: "steer", triggerTurn: true },
 			);
-		} catch {
-			// The session may already be gone in print/RPC mode; a failed
-			// notification must not affect the job itself.
-		}
-	}
+		},
+		{
+			maxItems: 10,
+			maxChars: 15_000,
+			maxAttempts: 3,
+			onDrop: (error, count) => {
+				const message = `Dropped ${count} background notification${count === 1 ? "" : "s"}: ${String(error)}`;
+				uiCtx?.ui.notify(message, "error");
+			},
+		},
+	);
 
 	function queueNotify(
 		job: BgJob,
@@ -277,14 +407,13 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 		ok: boolean,
 		dur: string,
 	): void {
-		pending.push({
+		const kind: NotificationKind = tag === "background-job-ready" ? "ready" : "finished";
+		notifications.enqueue({
+			jobId: job.id,
+			kind,
 			content: jobNotificationMetadata(tag, job.id, status, dur),
 			details: { id: job.id, name: job.name, status, ok, duration: dur },
 		});
-		if (!flushTimer) {
-			flushTimer = setTimeout(flushNotifications, NOTIFY_BATCH_MS);
-			flushTimer.unref?.();
-		}
 	}
 
 	// ------------------------------------------------------------------
@@ -331,13 +460,20 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 	// extensions (e.g. pi-claude-style-tools) re-register the default-hidden
 	// built-ins to attach custom renderers, which re-activates them as a side
 	// effect — so pruning must run on every session/agent start, not just once.
-	// bash and native powershell are always removed (pwsh replaces both);
-	// grep/find only when pi-fff's indexed search tools are present to take over.
+	// When runtime detection fails, leave Pi's built-in shells active and hide
+	// this extension's unavailable tools. Search tools are pruned only while
+	// the secure runtime is active and pi-fff replacements exist.
 	// ------------------------------------------------------------------
-	const prune = () => {
+	const prune = (_event: unknown, ctx: ExtensionContext) => {
+		const detected = runtime ?? detectRuntime();
 		const active = pi.getActiveTools();
-		const next = activeToolsWithPwsh(active);
-		if (next.length !== active.length) pi.setActiveTools(next);
+		const next = activeToolsForPowerShell(active, Boolean(detected));
+		if (next.length !== active.length || next.some((tool, index) => tool !== active[index])) {
+			pi.setActiveTools(next);
+		}
+		if (!detected && ctx.hasUI) {
+			ctx.ui.notify(runtimeError ?? "A trusted PowerShell runtime is unavailable", "warning");
+		}
 	};
 	pi.on("session_start", prune);
 	pi.on("agent_start", prune);
@@ -352,7 +488,7 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 		for (const job of jobs.values()) {
 			if (job.running && job.proc.pid) {
 				try {
-					killTree(job.proc.pid);
+					killProcessTree(job.proc.pid);
 				} catch {}
 			}
 		}
@@ -373,18 +509,33 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 	// they belong to this session and a fresh extension instance cannot take
 	// them over — and unregister everything registered above so repeated
 	// reloads don't accumulate listeners, timers, or widgets.
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", async () => {
 		shutdown = true;
+		notifications.dispose();
 		reap();
 		process.off("exit", reap);
 		for (const sig of SIGNALS) process.off(sig, onSignal);
 		jobList.dispose();
+		const runningJobs = [...jobs.values()].filter((job) => job.running || job.settling);
+		await Promise.all(
+			runningJobs.map(
+				(job) =>
+					new Promise<void>((resolve) => {
+						let done = false;
+						const finish = () => {
+							if (done) return;
+							done = true;
+							clearTimeout(timer);
+							job.watchers.delete(finish);
+							resolve();
+						};
+						const timer = setTimeout(finish, 2_000);
+						job.watchers.add(finish);
+						if (!job.running && !job.settling) finish();
+					}),
+			),
+		);
 		uiCtx = undefined;
-		if (flushTimer) {
-			clearTimeout(flushTimer);
-			flushTimer = undefined;
-		}
-		pending.length = 0;
 	});
 
 	function notifyFinished(job: BgJob): void {
@@ -401,13 +552,15 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 
 	function notifyReady(job: BgJob): void {
 		const dur = fmtDuration(Date.now() - job.startedAt);
-		queueNotify(
-			job,
-			"background-job-ready",
-			"ready",
-			true,
-			dur,
-		);
+		queueNotify(job, "background-job-ready", "ready", true, dur);
+	}
+
+	function observeJobState(job: BgJob, ready = false): void {
+		if (ready && job.readyNotified) notifications.cancel(job.id, ["ready"]);
+		if (!job.running) {
+			job.terminalObserved = true;
+			notifications.cancel(job.id, ["finished"]);
+		}
 	}
 
 	// ------------------------------------------------------------------
@@ -417,10 +570,10 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 		name: "pwsh",
 		label: "pwsh",
 		description:
-			`Run a command in PowerShell 7 on Windows; returns combined stdout/stderr. cd persists between calls; variables and functions do not (fresh process per call — chain dependent steps in one command). Foreground calls are killed after ${FG_DEFAULT_TIMEOUT_SEC}s by default (timeout param). For anything long-running or never-ending (dev servers, watchers, builds, test suites) set run_in_background: true — returns a job id immediately, and a metadata-only <background-job-finished> notification with exit status and runtime is delivered automatically when the process exits; no untrusted command/output text is injected. For servers that never exit, also pass notify_on (regex): the first output match delivers a metadata-only <background-job-ready> notification, e.g. notify_on: "Local:.*http" for vite. Retrieve output explicitly with pwsh_job output/wait.`,
-		promptSnippet: "Run PowerShell 7 command (the shell on this Windows machine)",
+			`Run a command in PowerShell on Windows (PowerShell 7 preferred, trusted Windows PowerShell fallback); returns combined stdout/stderr. cd persists between calls; variables and functions do not (fresh process per call — chain dependent steps in one command). Foreground calls are killed after ${FG_DEFAULT_TIMEOUT_SEC}s by default (timeout param). For anything long-running or never-ending (dev servers, watchers, builds, test suites) set run_in_background: true — returns a job id immediately, and a metadata-only <background-job-finished> notification with exit status and runtime is delivered automatically when the process exits; no untrusted command/output text is injected. For servers that never exit, also pass notify_on (regex): the first output match delivers a metadata-only <background-job-ready> notification, e.g. notify_on: "Local:.*http" for vite. Retrieve output explicitly with pwsh_job output/wait.`,
+		promptSnippet: "Run a PowerShell command (the shell on this Windows machine)",
 		promptGuidelines: [
-			"The shell is PowerShell 7, not bash: use PowerShell syntax ($env:VAR, cmdlets, PowerShell quoting). && and || work. Windows and forward-slash paths both accepted.",
+			"The shell is PowerShell, not bash: use PowerShell syntax ($env:VAR, cmdlets, PowerShell quoting). PowerShell 7 is preferred; on the Windows PowerShell fallback, PowerShell 7-only syntax such as && and || is unavailable. Windows and forward-slash paths are accepted.",
 			"Never run interactive commands (Read-Host, pause, git rebase -i): the process is non-interactive and they will hang until timeout.",
 			"After starting a background job, continue with other work or end your turn; ready/finished notifications arrive on their own. If you cannot proceed without the job's result, block on it with pwsh_job action \"wait\" (pattern/exit/timeout) instead of polling pwsh_job output.",
 			"Never fabricate or predict a pending background job's result — notifications are injected by the system, never written by you. Report only what a notification, wait, or output check actually said.",
@@ -448,13 +601,13 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 		}),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			uiCtx = ctx;
-			shell ??= findShell();
+			const detected = requireRuntime();
 			rejectTrailingAmpersand(params.command);
-			if (currentCwd && !existsSync(currentCwd)) currentCwd = undefined;
-			const cwd = currentCwd ?? ctx.cwd;
 
 			// ---------- background ----------
 			if (params.run_in_background) {
+				if (currentCwd && !existsSync(currentCwd)) currentCwd = undefined;
+				const cwd = currentCwd ?? ctx.cwd;
 				let readyRegex: RegExp | undefined;
 				if (params.notify_on) {
 					try {
@@ -464,11 +617,9 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 					}
 				}
 				const id = `bg-${++jobCounter}`;
-				const proc = spawn(shell, shellArgs(UTF8_PRELUDE + params.command + BG_SUFFIX), {
+				const proc = spawnPowerShell(detected.executable, buildPowerShellScript(params.command), {
 					cwd,
-					windowsHide: true,
-					stdio: ["ignore", "pipe", "pipe"],
-					env: { ...process.env, ...SPAWN_ENV },
+					env: buildToolEnv(ctx),
 				});
 				const job: BgJob = {
 					id,
@@ -477,35 +628,36 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 					cwd,
 					proc,
 					output: "",
+					baseOffset: 0,
 					cursor: 0,
 					pendingCarriageReturn: false,
 					truncated: false,
 					startedAt: Date.now(),
 					exitCode: null,
 					running: true,
+					settling: false,
 					killedByTool: false,
 					timedOut: false,
 					readyNotified: false,
 					watchers: new Set(),
 					waiters: 0,
+					terminalObserved: false,
 					mutex: Promise.resolve(),
 				};
-				const append = (chunk: Buffer) => {
-					// PowerShell writes CRLF on Windows. A raw CR in a TUI render moves
-					// the terminal cursor to column zero, which can overwrite the overlay
-					// border and make all content appear blank. Treat bare CR progress
-					// updates as line breaks too. Handle CRLF split across chunk boundaries.
-					let text = chunk.toString("utf8");
+				const appendText = (decoded: string) => {
+					let text = decoded;
 					if (job.pendingCarriageReturn) {
 						if (text.startsWith("\n")) text = text.slice(1);
 						job.pendingCarriageReturn = false;
 					}
 					job.pendingCarriageReturn = text.endsWith("\r");
-					job.output += text.replace(/\r\n?/g, "\n");
+					text = text.replace(/\r\n?/g, "\n");
+					if (!text) return;
+					job.output += text;
 					if (job.output.length > BG_MAX_BUFFER_CHARS) {
 						const dropped = job.output.length - BG_MAX_BUFFER_CHARS;
 						job.output = job.output.slice(dropped);
-						job.cursor = Math.max(0, job.cursor - dropped);
+						job.baseOffset += dropped;
 						job.truncated = true;
 					}
 					if (readyRegex && !job.readyNotified) {
@@ -517,44 +669,61 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 					}
 					for (const w of [...job.watchers]) w();
 				};
-				proc.stdout?.on("data", append);
-				proc.stderr?.on("data", append);
+				const captureStream = (stream: typeof proc.stdout, decoder: StringDecoder) =>
+					new Promise<void>((resolve) => {
+						if (!stream) return resolve();
+						let settled = false;
+						stream.on("data", (chunk: Buffer) => appendText(decoder.write(chunk)));
+						const finish = () => {
+							if (settled) return;
+							settled = true;
+							appendText(decoder.end());
+							resolve();
+						};
+						stream.once("end", finish);
+						stream.once("close", finish);
+					});
+				const outputSettled = Promise.all([
+					captureStream(proc.stdout, new StringDecoder("utf8")),
+					captureStream(proc.stderr, new StringDecoder("utf8")),
+				]);
 				if (params.timeout && params.timeout > 0) {
 					job.timer = setTimeout(() => {
 						if (job.running && proc.pid) {
 							job.timedOut = true;
-							killTree(proc.pid);
+							try {
+								killProcessTree(proc.pid);
+							} catch (error) {
+								appendText(`\n[kill error] ${String(error)}\n`);
+								uiCtx?.ui.notify(`Failed to stop timed-out ${job.id}: ${String(error)}`, "error");
+							}
 						}
 					}, params.timeout * 1000);
 					job.timer.unref?.();
 				}
-				const onExit = (annotate?: () => void) => {
-					if (!job.running) return;
-					job.running = false;
-					job.endedAt = Date.now();
+				const onExit = async (annotate?: () => void) => {
+					if (!job.running || job.settling) return;
+					job.settling = true;
 					annotate?.();
 					if (job.timer) clearTimeout(job.timer);
-					// The session may already be gone: reap() kills the tree synchronously,
-					// but the close event arrives on a later tick, after session_shutdown
-					// has run — notifying then would leak into the next session.
-					if (shutdown) return;
-					// An in-flight `wait` observes the exit and returns it directly;
-					// a finished notification on top would be redundant.
-					const observed = job.waiters > 0;
+					await outputSettled;
+					job.endedAt = Date.now();
+					job.running = false;
+					job.settling = false;
+					const observed = job.waiters > 0 || job.terminalObserved;
 					for (const w of [...job.watchers]) w();
+					if (shutdown) return;
 					if (!job.killedByTool && !observed) notifyFinished(job);
 					updateRunningStatus();
 				};
-				proc.on("error", (err) =>
-					onExit(() => {
-						job.output += `\n[spawn error] ${err.message}`;
-					}),
-				);
-				proc.on("close", (code) =>
-					onExit(() => {
+				proc.on("error", (err) => {
+					void onExit(() => appendText(`\n[spawn error] ${err.message}\n`));
+				});
+				proc.on("close", (code) => {
+					void onExit(() => {
 						job.exitCode = code;
-					}),
-				);
+					});
+				});
 				jobs.set(id, job);
 				updateRunningStatus();
 				return textResult(
@@ -565,41 +734,63 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 			}
 
 			// ---------- foreground ----------
-			// Foreground calls serialize on a promise chain: cd persistence is
-			// session-wide state, so concurrent foreground calls would race on
-			// the final cwd. Background jobs bypass the chain (they never
-			// touch currentCwd).
+			// Resolve cwd only after this call reaches the queue so a preceding
+			// concurrent directory change is visible to the next command.
 			const timeoutSec = params.timeout ?? FG_DEFAULT_TIMEOUT_SEC;
 			const exec = () => {
 				if (signal?.aborted) return Promise.reject(new Error("command aborted"));
+				if (currentCwd && !existsSync(currentCwd)) currentCwd = undefined;
+				const cwd = currentCwd ?? ctx.cwd;
 				return new Promise<ReturnType<typeof textResult>>((resolve, reject) => {
-					const proc = spawn(shell!, shellArgs(UTF8_PRELUDE + params.command + FG_SUFFIX), {
-						cwd,
-						windowsHide: true,
-						stdio: ["ignore", "pipe", "pipe"],
-						env: { ...process.env, ...SPAWN_ENV },
-					});
+					const proc = spawnPowerShell(
+						detected.executable,
+						buildPowerShellScript(params.command, CWD_MARKER),
+						{ cwd, env: buildToolEnv(ctx) },
+					);
 					let out = "";
+					let pendingCarriageReturn = false;
 					let timedOut = false;
 					let aborted = false;
+					let killError: string | undefined;
+					const stop = () => {
+						if (!proc.pid) return;
+						try {
+							killProcessTree(proc.pid);
+						} catch (error) {
+							killError = String(error);
+						}
+					};
 					const timer =
 						timeoutSec > 0
 							? setTimeout(() => {
 									timedOut = true;
-									if (proc.pid) killTree(proc.pid);
+									stop();
 								}, timeoutSec * 1000)
 							: undefined;
+					timer?.unref?.();
 					const onAbort = () => {
 						aborted = true;
-						if (proc.pid) killTree(proc.pid);
+						stop();
 					};
 					signal?.addEventListener("abort", onAbort, { once: true });
-					const append = (chunk: Buffer) => {
-						out += chunk.toString("utf8");
+					const appendText = (decoded: string) => {
+						let text = decoded;
+						if (pendingCarriageReturn) {
+							if (text.startsWith("\n")) text = text.slice(1);
+							pendingCarriageReturn = false;
+						}
+						pendingCarriageReturn = text.endsWith("\r");
+						text = text.replace(/\r\n?/g, "\n");
+						if (!text) return;
+						out += text;
 						onUpdate?.(textResult(tailChars(out, FG_LIVE_PREVIEW_CHARS)));
 					};
-					proc.stdout?.on("data", append);
-					proc.stderr?.on("data", append);
+					const stdoutDecoder = new StringDecoder("utf8");
+					const stderrDecoder = new StringDecoder("utf8");
+					proc.stdout?.on("data", (chunk: Buffer) => appendText(stdoutDecoder.write(chunk)));
+					proc.stderr?.on("data", (chunk: Buffer) => appendText(stderrDecoder.write(chunk)));
+					proc.stdout?.on("end", () => appendText(stdoutDecoder.end()));
+					proc.stderr?.on("end", () => appendText(stderrDecoder.end()));
 					const cleanup = () => {
 						if (timer) clearTimeout(timer);
 						signal?.removeEventListener("abort", onAbort);
@@ -611,28 +802,27 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 					proc.on("close", (code) => {
 						cleanup();
 						const notes: string[] = [];
-						// Extract the cwd marker line (absent if the command exited early).
 						let text = out;
-						const mi = text.lastIndexOf(CWD_MARKER);
-						if (mi >= 0) {
-							const le = text.indexOf("\n", mi);
-							const dir = text.slice(mi + CWD_MARKER.length, le === -1 ? undefined : le).trim();
-							text = text.slice(0, mi) + (le === -1 ? "" : text.slice(le + 1));
-							if (dir && dir !== cwd) notes.push(`cwd is now ${dir}`);
-							if (dir) currentCwd = dir;
+						const markerIndex = text.lastIndexOf(CWD_MARKER);
+						if (markerIndex >= 0) {
+							const lineEnd = text.indexOf("\n", markerIndex);
+							const dir = text
+								.slice(markerIndex + CWD_MARKER.length, lineEnd === -1 ? undefined : lineEnd)
+								.trim();
+							text = text.slice(0, markerIndex) + (lineEnd === -1 ? "" : text.slice(lineEnd + 1));
+							if (dir && !samePath(dir, cwd)) notes.push(`cwd is now ${dir}`);
+							if (dir) currentCwd = resolvePath(dir);
 						}
 						text = text.trim();
-						if (text.length > FG_MAX_RESULT_CHARS) {
-							text = `[output truncated, showing tail]\n${tailChars(text, FG_MAX_RESULT_CHARS)}`;
-						}
 						if (timedOut)
 							notes.push(
 								`command timed out after ${timeoutSec}s and was killed. If this is a dev server or watcher, rerun with run_in_background: true`,
 							);
 						else if (aborted) notes.push("command aborted");
 						else if (code !== 0) notes.push(`exit code: ${code}`);
+						if (killError) notes.push(`process-tree cleanup error: ${killError}`);
 						if (notes.length > 0) text = text ? `${text}\n\n${notes.join("; ")}` : notes.join("; ");
-						resolve(textResult(text || "(no output)"));
+						resolve(textResult(boundedTail(text || "(no output)")));
 					});
 				});
 			};
@@ -698,9 +888,13 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 				);
 			}
 			if (params.action === "kill") {
-				if (!job.running) return textResult(`${job.id} already finished (${statusOf(job)}).`);
+				notifications.cancel(job.id);
+				if (!job.running) {
+					job.terminalObserved = true;
+					return textResult(`${job.id} already finished (${statusOf(job)}).`);
+				}
+				if (job.proc.pid) killProcessTree(job.proc.pid);
 				job.killedByTool = true;
-				if (job.proc.pid) killTree(job.proc.pid);
 				return textResult(`Killed ${job.id} (PID ${job.proc.pid}).`);
 			}
 			if (params.action === "wait") {
@@ -731,9 +925,10 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 					};
 					const check = () => {
 						if (regex) {
-							const m = regex.exec(job.output.slice(startCursor));
+							const relativeStart = Math.max(0, startCursor - job.baseOffset);
+							const m = regex.exec(job.output.slice(relativeStart));
 							if (m) {
-								matchedLine = lineAt(job.output, startCursor + m.index);
+								matchedLine = lineAt(job.output, relativeStart + m.index);
 								return finish("matched");
 							}
 						}
@@ -749,6 +944,7 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 					signal?.addEventListener("abort", onAbort, { once: true });
 					check(); // the condition may already hold (buffered match / already exited)
 				});
+				observeJobState(job, outcome === "matched");
 				const fresh = await consumeCursor(job);
 				const dur = fmtDuration((job.endedAt ?? Date.now()) - job.startedAt);
 				const head =
@@ -759,18 +955,24 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 							: outcome === "timeout"
 								? `${job.id} — wait timed out after ${timeoutSec}s, job still ${statusOf(job)} (runtime ${dur})`
 								: `${job.id} — wait aborted, job still ${statusOf(job)}`;
-				const body = tailLines(fresh, WAIT_TAIL_LINES).trim();
-				return textResult(`${head}\n--- output since last check ---\n${body || "(no output)"}`);
+				const body = tailLines(fresh.text, WAIT_TAIL_LINES).trim() || "(no output)";
+				const warning = fresh.missed ? "[warning: unseen output rolled out of the in-memory buffer]\n" : "";
+				return textResult(boundedResult(`${head}\n${warning}--- output since last check ---`, body, WAIT_TAIL_LINES));
 			}
 			// action === "output": incremental since the previous check
-			const n = params.lines ?? 100;
+			observeJobState(job, true);
+			const requestedLines = Math.max(0, Math.floor(params.lines ?? 100));
 			const fresh = await consumeCursor(job);
-			const body = n === 0 ? job.output : tailLines(fresh, n);
+			const bodySource = requestedLines === 0 ? job.output : tailLines(fresh.text, requestedLines);
+			const body = bodySource.trim() || (requestedLines === 0 ? "(no output)" : "(no new output since last check)");
 			const dur = fmtDuration((job.endedAt ?? Date.now()) - job.startedAt);
 			const head = `${job.id} — ${statusOf(job)}, ${job.running ? "running for" : "ran"} ${dur}${
 				job.truncated ? " (buffer truncated, oldest output dropped)" : ""
-			}${n === 0 ? "" : fresh ? ", new output since last check:" : ""}`;
-			return textResult(`${head}\n${body.trim() || (n === 0 ? "(no output)" : "(no new output since last check)")}`);
+			}${requestedLines === 0 ? "" : fresh.text ? ", new output since last check:" : ""}`;
+			const warning = fresh.missed ? "[warning: unseen output rolled out of the in-memory buffer]" : "";
+			return textResult(
+				boundedResult([head, warning].filter(Boolean).join("\n"), body, requestedLines === 0 ? DEFAULT_MAX_LINES : requestedLines),
+			);
 		},
 	});
 }

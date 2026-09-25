@@ -2,13 +2,17 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { win32 } from "node:path";
 import { AUTOMATED_NOTE, jobNotificationMetadata } from "../src/notifications.ts";
-import { findPowerShellExecutable, shellArgs, taskkillExecutable } from "../src/security.ts";
-import { activeToolsWithPwsh } from "../src/tool-selection.ts";
+import {
+	findPowerShellRuntime,
+	powerShellCandidates,
+	taskkillExecutable,
+} from "../src/security.ts";
+import { activeToolsForPowerShell, activeToolsWithPwsh } from "../src/tool-selection.ts";
 
 test("PowerShell resolution ignores cwd-relative and empty PATH entries", () => {
 	const attempted: string[] = [];
 	const expected = String.raw`C:\Tools\PowerShell\pwsh.exe`;
-	const resolved = findPowerShellExecutable(
+	const resolved = findPowerShellRuntime(
 		{
 			Path: String.raw`;.;relative\bin;C:\Tools\PowerShell`,
 			SystemRoot: String.raw`C:\Windows`,
@@ -17,9 +21,10 @@ test("PowerShell resolution ignores cwd-relative and empty PATH entries", () => 
 			attempted.push(candidate);
 			return candidate === expected;
 		},
+		(executable) => ({ executable, version: "7.5.0", edition: "Core", kind: "pwsh" }),
 	);
 
-	assert.equal(resolved, expected);
+	assert.equal(resolved.executable, expected);
 	assert.ok(attempted.every((candidate) => win32.isAbsolute(candidate)));
 	assert.ok(attempted.every((candidate) => !candidate.includes("relative")));
 });
@@ -27,15 +32,59 @@ test("PowerShell resolution ignores cwd-relative and empty PATH entries", () => 
 test("PowerShell 7 is preferred over Windows PowerShell", () => {
 	const pwsh = String.raw`C:\Program Files\PowerShell\7\pwsh.exe`;
 	const windowsPowerShell = String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`;
-	const resolved = findPowerShellExecutable(
+	const resolved = findPowerShellRuntime(
 		{
 			ProgramFiles: String.raw`C:\Program Files`,
 			SystemRoot: String.raw`C:\Windows`,
 		},
 		(candidate) => candidate === pwsh || candidate === windowsPowerShell,
+		(executable) =>
+			executable === pwsh
+				? { executable, version: "7.5.0", edition: "Core", kind: "pwsh" }
+				: { executable, version: "5.1", edition: "Desktop", kind: "windows-powershell" },
 	);
 
-	assert.equal(resolved, pwsh);
+	assert.equal(resolved.executable, pwsh);
+});
+
+test("runtime metadata is returned only after probing an absolute candidate", () => {
+	const expected = String.raw`C:\Tools\PowerShell\pwsh.exe`;
+	const runtime = findPowerShellRuntime(
+		{ Path: String.raw`.;;relative\bin;C:\Tools\PowerShell` },
+		(candidate) => candidate === expected,
+		(executable) => ({ executable, version: "7.5.0", edition: "Core", kind: "pwsh" }),
+	);
+	assert.deepEqual(runtime, { executable: expected, version: "7.5.0", edition: "Core", kind: "pwsh" });
+});
+
+test("validated Windows PowerShell remains the fallback when PowerShell 7 is absent", () => {
+	const windowsPowerShell = String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`;
+	const runtime = findPowerShellRuntime(
+		{ SystemRoot: String.raw`C:\Windows` },
+		(candidate) => candidate === windowsPowerShell,
+		(executable) => ({ executable, version: "5.1.22621.4391", edition: "Desktop", kind: "windows-powershell" }),
+	);
+	assert.equal(runtime.executable, windowsPowerShell);
+	assert.equal(runtime.kind, "windows-powershell");
+});
+
+test("relative executable overrides are rejected instead of resolved from cwd", () => {
+	assert.throws(
+		() => powerShellCandidates({ PI_PWSH_NOTIFY_EXECUTABLE: String.raw`.\pwsh.exe` }),
+		/must be an absolute Windows path/,
+	);
+});
+
+test("candidate enumeration never invokes or returns an unqualified discovery command", () => {
+	const candidates = powerShellCandidates({
+		Path: String.raw`;.;relative\bin;C:\Tools\PowerShell`,
+		ProgramFiles: String.raw`C:\Program Files`,
+		SystemRoot: String.raw`C:\Windows`,
+	});
+	assert.ok(candidates.length > 0);
+	assert.ok(candidates.every((candidate) => win32.isAbsolute(candidate)));
+	assert.ok(candidates.every((candidate) => !/where\.exe$/i.test(candidate)));
+	assert.ok(candidates.every((candidate) => !candidate.includes("relative")));
 });
 
 test("taskkill is resolved only from System32", () => {
@@ -44,13 +93,6 @@ test("taskkill is resolved only from System32", () => {
 		taskkillExecutable({ SystemRoot: String.raw`D:\Windows`, Path: String.raw`. ; C:\malicious` }, (p) => p === expected),
 		expected,
 	);
-});
-
-test("PowerShell arguments do not bypass execution policy", () => {
-	const args = shellArgs("Write-Output ok");
-	assert.deepEqual(args.slice(0, 3), ["-NoProfile", "-NonInteractive", "-EncodedCommand"]);
-	assert.ok(!args.includes("-ExecutionPolicy"));
-	assert.ok(!args.includes("Bypass"));
 });
 
 test("automatic notifications contain metadata but no command or process output", () => {
@@ -79,4 +121,11 @@ test("the extension removes both built-in shell tools", () => {
 test("grep and find remain available unless pi-fff replaces them", () => {
 	assert.deepEqual(activeToolsWithPwsh(["grep", "find", "read"]), ["grep", "find", "read"]);
 	assert.deepEqual(activeToolsWithPwsh(["grep", "find", "ffgrep", "read"]), ["ffgrep", "read"]);
+});
+
+test("unavailable runtime hides extension tools and preserves Pi built-ins", () => {
+	assert.deepEqual(
+		activeToolsForPowerShell(["read", "bash", "powershell", "pwsh", "pwsh_job", "grep", "find"], false),
+		["read", "bash", "powershell", "grep", "find"],
+	);
 });
