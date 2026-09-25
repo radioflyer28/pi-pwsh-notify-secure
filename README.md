@@ -49,6 +49,12 @@ Two tools, Claude Code-shaped: background execution is a parameter, not a separa
 | `pwsh` | Run a command (replaces built-in `bash`). `run_in_background: true` starts a job that **auto-notifies on exit**; `notify_on` (regex) adds a **ready notification** for servers that never exit |
 | `pwsh_job` | Background job management: incremental output / **blocking wait** (Claude Code's Monitor) / list / kill (`taskkill /T /F`) |
 
+### Tool display
+
+Both `pwsh` and `pwsh_job` use purpose-built TUI rendering. Collapsed `pwsh` calls retain the beginning of the command, while collapsed `pwsh_job` calls identify the action, job id, and relevant options. Result previews retain the newest five visual lines and show how much earlier content is hidden. Expanding tool output displays the complete invocation and all text retained in the tool result; it cannot recover output already bounded by execution limits.
+
+Expansion uses Pi's configurable `app.tools.expand` action (`Ctrl-O` by default), so custom keybindings are honored automatically. Display rendering is UI-only and does not alter tool arguments, result content/details, conversation messages, or model context.
+
 ### Foreground `pwsh`
 
 - **`cd` persists between calls** (tracked by the extension); variables and functions do not — each call is a fresh `pwsh -NoProfile -NonInteractive` process
@@ -143,6 +149,8 @@ agent 在后台启动构建或 dev server 后可以继续和你对话；进程�
 | --- | --- |
 | `pwsh` | 执行命令（替换内置 `bash`）；`run_in_background: true` 启动后台任务并**在退出时自动通知**，`notify_on` 正则为常驻进程加**就绪通知** |
 | `pwsh_job` | 后台任务管理：增量输出 / **阻塞等待**（对应 Claude Code 的 Monitor：等输出匹配正则或进程退出）/ 列表 / 杀掉整棵进程树 |
+
+两个工具都有专用 TUI 显示：折叠时保留命令开头或任务操作摘要，并显示结果最新五个可视行；展开后显示工具结果中仍保留的全部文本。展开沿用 Pi 可配置的 `app.tools.expand` 动作（默认 `Ctrl-O`），不会注册扩展自己的快捷键，也不会更改传给模型的参数、结果或会话消息。
 
 前台 `pwsh`：**`cd` 在调用之间持久**（变量/函数不持久，每次都是全新 `pwsh -NoProfile -NonInteractive` 进程）；命令通过固定 bootstrap 以无 BOM UTF-8 从 stdin 传入，不受 Windows 命令行长度和嵌套引号限制；默认 120 秒超时并清理整棵进程树；结尾 `&` 会被拦截并提示改用后台参数。`pwsh_job` 的输出是**增量且有界的**——每次只返回上次检查之后的新输出，`lines: 0` 也受 Pi 标准字节/行数限制；内存尾部滚动导致未读数据丢失时会明确警告。默认不会把完整命令输出写入临时日志。
 
