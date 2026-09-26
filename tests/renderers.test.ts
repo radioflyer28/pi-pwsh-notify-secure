@@ -264,6 +264,30 @@ test("expanded and error results retain all available diagnostic text", () => {
 	);
 });
 
+test("unchanged call and completed-result rows reuse width-specific render caches", () => {
+	installExpandBinding("ctrl+o");
+	const args = deepFreeze({ command: "Write-Output cached" });
+	const call = renderPwshCall(args, theme, context(args));
+	const firstCall = call.render(80);
+	assert.strictEqual(call.render(80), firstCall);
+	assert.notStrictEqual(call.render(40), firstCall);
+	const fortyColumnCall = call.render(40);
+	assert.strictEqual(call.render(40), fortyColumnCall);
+	call.invalidate();
+	assert.notStrictEqual(call.render(40), fortyColumnCall);
+
+	const toolResult = deepFreeze(result(Array.from({ length: 30 }, (_, i) => `line ${i}`).join("\n")));
+	const resultContext = context({}, { state: { startedAt: 0, endedAt: 1000 } });
+	const component = renderPowerShellResult(toolResult, { expanded: false, isPartial: false }, theme, resultContext);
+	const firstResult = component.render(80);
+	assert.strictEqual(component.render(80), firstResult);
+	assert.notStrictEqual(component.render(40), firstResult);
+	const fortyColumnResult = component.render(40);
+	assert.strictEqual(component.render(40), fortyColumnResult);
+	component.invalidate();
+	assert.notStrictEqual(component.render(40), fortyColumnResult);
+});
+
 test("README documents both tool renderers and Pi's configurable expansion action", () => {
 	const readme = readFileSync(fileURLToPath(new URL("../README.md", import.meta.url)), "utf8");
 	assert.match(readme, /Both `pwsh` and `pwsh_job` use purpose-built TUI rendering/);

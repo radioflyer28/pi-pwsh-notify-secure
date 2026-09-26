@@ -1,13 +1,13 @@
 # pi-pwsh-notify-secure
 
-Security-hardened private fork of [oversk7/pi-pwsh-notify](https://github.com/oversk7/pi-pwsh-notify). Release `0.5.0-secure.1` selectively adapts upstream 0.5.0 reliability work without adopting its weaker executable resolution, execution-policy override, automatic output disclosure, or default complete-output logs.
+Security-hardened private fork of [oversk7/pi-pwsh-notify](https://github.com/oversk7/pi-pwsh-notify). Release `0.5.0-secure.2` selectively adapts upstream 0.5.0 reliability work without adopting its weaker executable resolution, execution-policy override, automatic output disclosure, or default complete-output logs.
 
 English | [中文说明](#中文说明)
 
 Trusted PowerShell shell for [pi](https://pi.dev) on Windows (PowerShell 7 preferred, Windows PowerShell fallback), with **Claude Code-style background jobs that auto-notify the agent on completion** — no polling.
 
 ```
-pi install git:github.com/radioflyer28/pi-pwsh-notify-secure@v0.5.0-secure.1
+pi install git:github.com/radioflyer28/pi-pwsh-notify-secure@v0.5.0-secure.2
 ```
 
 ## Why
@@ -53,7 +53,7 @@ Two tools, Claude Code-shaped: background execution is a parameter, not a separa
 
 Both `pwsh` and `pwsh_job` use purpose-built TUI rendering. Collapsed `pwsh` calls retain the beginning of the command, while collapsed `pwsh_job` calls identify the action, job id, and relevant options. Result previews retain the newest five visual lines and show how much earlier content is hidden. Expanding tool output displays the complete invocation and all text retained in the tool result; it cannot recover output already bounded by execution limits.
 
-Expansion uses Pi's configurable `app.tools.expand` action (`Ctrl-O` by default), so custom keybindings are honored automatically. Display rendering is UI-only and does not alter tool arguments, result content/details, conversation messages, or model context.
+Expansion uses Pi's configurable `app.tools.expand` action (`Ctrl-O` by default), so custom keybindings are honored automatically. Display rendering is UI-only and does not alter tool arguments, result content/details, conversation messages, or model context. Completed rows cache their width-specific presentation so ordinary TUI redraws do not repeatedly re-wrap retained output.
 
 ### Foreground `pwsh`
 
@@ -124,7 +124,7 @@ Expansion uses Pi's configurable `app.tools.expand` action (`Ctrl-O` by default)
 Windows 下给 [pi](https://pi.dev) 用的 PowerShell 7 shell，带 Claude Code 风格的后台任务：**任务结束后自动通知 agent，无需轮询**。
 
 ```
-pi install git:github.com/radioflyer28/pi-pwsh-notify-secure@v0.5.0-secure.1
+pi install git:github.com/radioflyer28/pi-pwsh-notify-secure@v0.5.0-secure.2
 ```
 
 ### 它解决的问题

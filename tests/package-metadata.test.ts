@@ -23,9 +23,9 @@ test("Pi peer floor, Pi 0.87.1 development versions, and TypeBox import are cons
 	assert.doesNotMatch(indexSource, /@sinclair\/typebox/);
 });
 
-test("release metadata and installation instructions use 0.5.0-secure.1", () => {
-	assert.equal(packageJson.version, "0.5.0-secure.1");
-	assert.match(readme, /pi-pwsh-notify-secure@v0\.5\.0-secure\.1/);
+test("release metadata and installation instructions use 0.5.0-secure.2", () => {
+	assert.equal(packageJson.version, "0.5.0-secure.2");
+	assert.match(readme, /pi-pwsh-notify-secure@v0\.5\.0-secure\.2/);
 });
 
 test("documentation records the secure upstream adaptation and compatibility behavior", () => {

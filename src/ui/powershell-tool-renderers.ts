@@ -99,28 +99,44 @@ function textOutput(result: AgentToolResult<unknown>): string {
 }
 
 class PowerShellCallComponent implements Component {
-	private renderText: (width: number) => string[];
+	private text = "";
+	private expanded = false;
+	private cachedWidth?: number;
+	private cachedLines?: string[];
 
-	constructor(renderText: (width: number) => string[]) {
-		this.renderText = renderText;
-	}
-
-	update(renderText: (width: number) => string[]): void {
-		this.renderText = renderText;
+	update(text: string, expanded: boolean): void {
+		if (text === this.text && expanded === this.expanded) return;
+		this.text = text;
+		this.expanded = expanded;
+		this.invalidate();
 	}
 
 	render(width: number): string[] {
-		return this.renderText(width);
+		const safeWidth = Math.max(1, width);
+		if (this.cachedWidth === safeWidth && this.cachedLines) return this.cachedLines;
+		this.cachedWidth = safeWidth;
+		this.cachedLines = renderHead(this.text, safeWidth, this.expanded);
+		return this.cachedLines;
 	}
 
-	invalidate(): void {}
+	invalidate(): void {
+		this.cachedWidth = undefined;
+		this.cachedLines = undefined;
+	}
 }
 
 class PowerShellResultComponent implements Component {
-	private result!: AgentToolResult<unknown>;
-	private options!: ToolRenderResultOptions;
+	private result?: AgentToolResult<unknown>;
+	private output = "";
+	private options: ToolRenderResultOptions = { expanded: false, isPartial: false };
 	private theme!: Theme;
 	private context!: PowerShellRenderContext<unknown>;
+	private isError = false;
+	private startedAt?: number;
+	private endedAt?: number;
+	private cachedWidth?: number;
+	private cachedTimeSecond?: number;
+	private cachedLines?: string[];
 
 	update(
 		result: AgentToolResult<unknown>,
@@ -128,42 +144,69 @@ class PowerShellResultComponent implements Component {
 		theme: Theme,
 		context: PowerShellRenderContext<unknown>,
 	): void {
+		const resultChanged = result !== this.result;
+		const changed =
+			resultChanged ||
+			options.expanded !== this.options.expanded ||
+			options.isPartial !== this.options.isPartial ||
+			theme !== this.theme ||
+			context.isError !== this.isError ||
+			context.state.startedAt !== this.startedAt ||
+			context.state.endedAt !== this.endedAt;
 		this.result = result;
-		this.options = options;
+		if (resultChanged) this.output = textOutput(result).trim();
+		this.options = { expanded: options.expanded, isPartial: options.isPartial };
 		this.theme = theme;
 		this.context = context;
+		this.isError = context.isError;
+		this.startedAt = context.state.startedAt;
+		this.endedAt = context.state.endedAt;
+		if (changed) this.invalidate();
 	}
 
 	render(width: number): string[] {
 		const safeWidth = Math.max(1, width);
+		const timeSecond = this.options.isPartial && !this.isError ? Math.floor(Date.now() / 1000) : -1;
+		if (this.cachedWidth === safeWidth && this.cachedTimeSecond === timeSecond && this.cachedLines) {
+			return this.cachedLines;
+		}
 		const state = this.context.state;
 		const now = state.endedAt ?? Date.now();
 		const duration = state.startedAt === undefined ? undefined : formatDuration(now - state.startedAt);
-		const status = this.context.isError
+		const status = this.isError
 			? `Failed${duration ? ` · Took ${duration}` : ""}`
 			: this.options.isPartial
 				? `Running${duration ? ` · Elapsed ${duration}` : ""}`
 				: `Done${duration ? ` · Took ${duration}` : ""}`;
-		const statusColor = this.context.isError ? "error" : this.options.isPartial ? "warning" : "success";
+		const statusColor = this.isError ? "error" : this.options.isPartial ? "warning" : "success";
 		const lines = [truncateToWidth(this.theme.fg(statusColor, status), safeWidth, safeWidth > 1 ? "…" : "")];
-		const output = textOutput(this.result).trim();
-		if (!output) return lines;
-
-		const outputColor = this.context.isError ? "error" : "toolOutput";
-		const styled = output
-			.split("\n")
-			.map((line) => this.theme.fg(outputColor, line))
-			.join("\n");
-		if (this.options.expanded) return [...lines, ...fitLines(wrapTextWithAnsi(styled, safeWidth), safeWidth)];
-
-		const preview = truncateToVisualLines(styled, RESULT_PREVIEW_LINES, safeWidth);
-		if (preview.skippedCount > 0) {
-			lines.push(...fitLines(expansionLabels(preview.skippedCount, "earlier"), safeWidth));
+		if (this.output) {
+			const outputColor = this.isError ? "error" : "toolOutput";
+			const styled = this.output
+				.split("\n")
+				.map((line) => this.theme.fg(outputColor, line))
+				.join("\n");
+			if (this.options.expanded) {
+				lines.push(...fitLines(wrapTextWithAnsi(styled, safeWidth), safeWidth));
+			} else {
+				const preview = truncateToVisualLines(styled, RESULT_PREVIEW_LINES, safeWidth);
+				if (preview.skippedCount > 0) {
+					lines.push(...fitLines(expansionLabels(preview.skippedCount, "earlier"), safeWidth));
+				}
+				lines.push(...fitLines(preview.visualLines, safeWidth));
+			}
 		}
-		return [...lines, ...fitLines(preview.visualLines, safeWidth)];
+		this.cachedWidth = safeWidth;
+		this.cachedTimeSecond = timeSecond;
+		this.cachedLines = lines;
+		return lines;
 	}
 
-	invalidate(): void {}
+	invalidate(): void {
+		this.cachedWidth = undefined;
+		this.cachedTimeSecond = undefined;
+		this.cachedLines = undefined;
+	}
 
 	dispose(): void {
 		clearTimingInterval(this.context.state);
@@ -172,13 +215,14 @@ class PowerShellResultComponent implements Component {
 
 function reuseCallComponent(
 	context: PowerShellRenderContext<unknown>,
-	renderText: (width: number) => string[],
+	text: string,
+	expanded: boolean,
 ): Component {
 	const component =
 		context.lastComponent instanceof PowerShellCallComponent
 			? context.lastComponent
-			: new PowerShellCallComponent(renderText);
-	component.update(renderText);
+			: new PowerShellCallComponent();
+	component.update(text, expanded);
 	return component;
 }
 
@@ -230,21 +274,19 @@ export function renderPwshCall(
 	context: PowerShellRenderContext<PwshRenderArgs>,
 ): Component {
 	beginTiming(context as PowerShellRenderContext<unknown>);
-	return reuseCallComponent(context as PowerShellRenderContext<unknown>, (width) => {
-		const command = asString(args?.command) ?? "...";
-		const options: string[] = [];
-		if (args?.run_in_background === true) options.push("background");
-		const name = asString(args?.name);
-		if (name) options.push(`name ${name}`);
-		const timeout = asFiniteNumber(args?.timeout);
-		if (timeout !== undefined) options.push(`timeout ${timeout}s`);
-		const notify = asString(args?.notify_on);
-		if (notify) options.push(`notify /${notify}/`);
-		const summary = `${theme.fg("toolTitle", theme.bold("PS>"))} ${theme.fg("accent", command)}${
-			options.length ? `\n${theme.fg("muted", options.join(" · "))}` : ""
-		}`;
-		return renderHead(summary, width, context.expanded);
-	});
+	const command = asString(args?.command) ?? "...";
+	const options: string[] = [];
+	if (args?.run_in_background === true) options.push("background");
+	const name = asString(args?.name);
+	if (name) options.push(`name ${name}`);
+	const timeout = asFiniteNumber(args?.timeout);
+	if (timeout !== undefined) options.push(`timeout ${timeout}s`);
+	const notify = asString(args?.notify_on);
+	if (notify) options.push(`notify /${notify}/`);
+	const summary = `${theme.fg("toolTitle", theme.bold("PS>"))} ${theme.fg("accent", command)}${
+		options.length ? `\n${theme.fg("muted", options.join(" · "))}` : ""
+	}`;
+	return reuseCallComponent(context as PowerShellRenderContext<unknown>, summary, context.expanded);
 }
 
 export function renderPwshJobCall(
@@ -253,21 +295,19 @@ export function renderPwshJobCall(
 	context: PowerShellRenderContext<PwshJobRenderArgs>,
 ): Component {
 	beginTiming(context as PowerShellRenderContext<unknown>);
-	return reuseCallComponent(context as PowerShellRenderContext<unknown>, (width) => {
-		const action = asString(args?.action) ?? "?";
-		const parts = [theme.fg("toolTitle", theme.bold("job")), theme.fg("accent", action)];
-		const id = asString(args?.id);
-		if (id) parts.push(theme.fg("accent", id));
-		const options: string[] = [];
-		const lines = asFiniteNumber(args?.lines);
-		if (action === "output" && lines !== undefined) options.push(lines === 0 ? "all buffered lines" : `${lines} lines`);
-		const pattern = asString(args?.pattern);
-		if (action === "wait" && pattern) options.push(`/${pattern}/`);
-		const timeout = asFiniteNumber(args?.timeout);
-		if (action === "wait" && timeout !== undefined) options.push(`${timeout}s`);
-		const summary = `${parts.join(" ")}${options.length ? ` · ${theme.fg("muted", options.join(" · "))}` : ""}`;
-		return renderHead(summary, width, context.expanded);
-	});
+	const action = asString(args?.action) ?? "?";
+	const parts = [theme.fg("toolTitle", theme.bold("job")), theme.fg("accent", action)];
+	const id = asString(args?.id);
+	if (id) parts.push(theme.fg("accent", id));
+	const options: string[] = [];
+	const lines = asFiniteNumber(args?.lines);
+	if (action === "output" && lines !== undefined) options.push(lines === 0 ? "all buffered lines" : `${lines} lines`);
+	const pattern = asString(args?.pattern);
+	if (action === "wait" && pattern) options.push(`/${pattern}/`);
+	const timeout = asFiniteNumber(args?.timeout);
+	if (action === "wait" && timeout !== undefined) options.push(`${timeout}s`);
+	const summary = `${parts.join(" ")}${options.length ? ` · ${theme.fg("muted", options.join(" · "))}` : ""}`;
+	return reuseCallComponent(context as PowerShellRenderContext<unknown>, summary, context.expanded);
 }
 
 export function renderPowerShellResult(
