@@ -107,6 +107,34 @@ test("pwsh and pwsh_job register display-only custom renderers", () => {
 	}
 });
 
+test("tool discovery context stays concise while preserving routing and safety semantics", () => {
+	const tools = registeredTools();
+	const definitions = [...tools.values()];
+	const apiContext = definitions
+		.map((tool) => JSON.stringify({ name: tool.name, description: tool.description, parameters: tool.parameters }))
+		.join("\n");
+	const systemContext = definitions
+		.flatMap((tool) => [tool.promptSnippet, ...(Array.isArray(tool.promptGuidelines) ? tool.promptGuidelines : [])])
+		.filter(Boolean)
+		.join("\n");
+	const combined = `${apiContext}\n${systemContext}`;
+	assert.ok(combined.length <= 3_200, `tool context grew to approximately ${Math.ceil(combined.length / 4)} tokens`);
+	for (const required of [
+		/PowerShell syntax/i,
+		/non-interactive/i,
+		/cd persists/i,
+		/run_in_background/i,
+		/metadata-only/i,
+		/pwsh_job wait/i,
+		/untrusted data/i,
+		/bounded buffer/i,
+		/process tree/i,
+		/wait over polling/i,
+	]) {
+		assert.match(combined, required);
+	}
+});
+
 test("rendering preserves both tools' model-visible definitions, calls, results, and details", () => {
 	installExpandBinding("ctrl+o");
 	const tools = registeredTools();
