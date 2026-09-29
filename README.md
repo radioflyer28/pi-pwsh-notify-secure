@@ -17,7 +17,7 @@ Pi 0.84.3 introduced an optional native `powershell` tool for ordinary foregroun
 1. Native Pi has no managed background jobs, persistent `cd`, blocking job wait, or ready/finished steering notifications.
 2. The native implementation examined at Pi 0.84.3 used unqualified executable discovery and cleanup helpers; this fork uses verified absolute executable paths and does not force `-ExecutionPolicy Bypass`.
 
-The peer floor remains Pi/TUI 0.84.3 after type-checking against that release. Development, integration tests, and extension smoke loading target Pi/TUI 0.87.1. See the [source-by-source Pi comparison](docs/research/pi-0.84.3-native-powershell.md) and the [upstream 0.5.0 secure-adaptation matrix](docs/research/upstream-0.5.0-secure-adaptation.md).
+The peer floor remains Pi/TUI 0.84.3 after type-checking against that release. Development, integration tests, and extension smoke loading target Pi/TUI 0.87.1. See the [source-by-source Pi comparison](docs/research/pi-0.84.3-native-powershell.md), the [upstream 0.5.0 secure-adaptation matrix](docs/research/upstream-0.5.0-secure-adaptation.md), and the [upstream synchronization checklist](docs/maintenance/upstream-sync.md).
 
 ### Symptoms this fixes
 
