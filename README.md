@@ -1,13 +1,13 @@
 # pi-pwsh-notify-secure
 
-Security-hardened private fork of [oversk7/pi-pwsh-notify](https://github.com/oversk7/pi-pwsh-notify). Release `0.5.0-secure.3` selectively adapts upstream 0.5.0 reliability work without adopting its weaker executable resolution, execution-policy override, automatic output disclosure, or default complete-output logs.
+Security-hardened private fork of [oversk7/pi-pwsh-notify](https://github.com/oversk7/pi-pwsh-notify). Release `0.5.0-secure.4` selectively adapts upstream 0.5.0 reliability work without adopting its weaker executable resolution, execution-policy override, automatic output disclosure, or default complete-output logs.
 
 English | [中文说明](#中文说明)
 
 Trusted PowerShell shell for [pi](https://pi.dev) on Windows (PowerShell 7 preferred, Windows PowerShell fallback), with **Claude Code-style background jobs that auto-notify the agent on completion** — no polling.
 
 ```
-pi install git:github.com/radioflyer28/pi-pwsh-notify-secure@v0.5.0-secure.3
+pi install git:github.com/radioflyer28/pi-pwsh-notify-secure@v0.5.0-secure.4
 ```
 
 ## Why
@@ -124,7 +124,7 @@ Expansion uses Pi's configurable `app.tools.expand` action (`Ctrl-O` by default)
 Windows 下给 [pi](https://pi.dev) 用的 PowerShell 7 shell，带 Claude Code 风格的后台任务：**任务结束后自动通知 agent，无需轮询**。
 
 ```
-pi install git:github.com/radioflyer28/pi-pwsh-notify-secure@v0.5.0-secure.3
+pi install git:github.com/radioflyer28/pi-pwsh-notify-secure@v0.5.0-secure.4
 ```
 
 ### 它解决的问题
