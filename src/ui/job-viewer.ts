@@ -8,6 +8,8 @@
 
 import { type Component, matchesKey, type TUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { BgJob } from "../index.js";
+import { jobStatus, jobStatusText } from "../job-status.js";
+export { jobStatusText } from "../job-status.js";
 
 /** Base lines consumed by chrome: top border + header + header sep + footer sep + footer + bottom border. */
 const CHROME_LINES = 6;
@@ -28,14 +30,6 @@ export function formatJobElapsed(ms: number): string {
 	if (s < 60) return `${s}s`;
 	const m = Math.floor(s / 60);
 	return `${m}m${s % 60}s`;
-}
-
-/** Human-readable status for a job, shared by the list and the viewer. */
-export function jobStatusText(job: BgJob): string {
-	if (job.running) return "running";
-	if (job.timedOut) return "timeout (killed)";
-	if (job.killedByTool) return "killed";
-	return `exited ${job.exitCode}`;
 }
 
 export class JobViewer implements Component {
@@ -71,7 +65,7 @@ export class JobViewer implements Component {
 		// Kill: first "x" arms, second confirms; any other key disarms. Only
 		// offered while the job is still running.
 		if (matchesKey(data, "x")) {
-			if (this.job.running && this.onKill) {
+			if ((this.job.running || this.job.outcome?.cleanupError) && this.onKill) {
 				if (this.killArmed) {
 					this.killArmed = false;
 					this.onKill();
@@ -127,7 +121,7 @@ export class JobViewer implements Component {
 			? th.fg("accent", "●")
 			: this.job.killedByTool
 				? th.fg("dim", "■")
-				: this.job.exitCode === 0
+				: jobStatus(this.job).ok
 					? th.fg("success", "✓")
 					: th.fg("error", "✗");
 		const elapsed = formatJobElapsed((this.job.endedAt ?? Date.now()) - this.job.startedAt);
@@ -150,7 +144,7 @@ export class JobViewer implements Component {
 		// Footer: actions on the left, navigation on the right
 		lines.push(row(th.fg("dim", "─".repeat(innerW))));
 		const actions: string[] = [];
-		if (this.job.running && this.onKill) {
+		if ((this.job.running || this.job.outcome?.cleanupError) && this.onKill) {
 			actions.push(this.killArmed ? th.fg("error", "x again to KILL") : th.fg("dim", "x kill"));
 		}
 		const footerRight = th.fg("dim", "↑↓ scroll · PgUp/PgDn · Esc close");

@@ -281,6 +281,6 @@ export function executionNotes(result: ExecutionOutcome): string[] {
 	else if (result.exitCode !== 0) notes.push(`exit code: ${result.exitCode}${result.signal ? ` (${result.signal})` : ""}`);
 	if (result.cleanupError) notes.push(`process-tree cleanup error: ${result.cleanupError}`);
 	if (result.outputIncomplete) notes.push("output capture ended before all pipes closed; late descendant output may be missing");
-	if (result.droppedChars) notes.push(`output truncated: ${result.droppedChars} characters dropped from the in-memory buffer`);
+	if (result.droppedChars) notes.push(`output truncated: ${result.droppedChars} UTF-16 code units dropped from the in-memory buffer`);
 	return notes;
 }

@@ -90,7 +90,11 @@ function makeHarness(options: HarnessOptions = {}) {
     async protocol(tool: string, params: Record<string, unknown>, signal?: AbortSignal) {
       let result: any;
       let isError = false;
-      const wrapped = wrapRegisteredTool({ definition: tools.get(tool) } as any, { createContext: () => ctx } as any);
+      // Both public wrapper contracts are deliberately exercised by the host matrix.
+      const contextFactory = { createContext: () => ctx, createToolContext: (_id: string, _signal?: AbortSignal) => ctx,
+        getActiveTools: () => [...activeTools] };
+      const wrapped = wrapRegisteredTool({ definition: tools.get(tool) } as any,
+        contextFactory as unknown as Parameters<typeof wrapRegisteredTool>[1]);
       try { result = await wrapped.execute("protocol-call", params, signal); }
       catch (error) {
         isError = true;
@@ -106,6 +110,17 @@ function makeHarness(options: HarnessOptions = {}) {
 }
 
 const textOf = (result: any): string => result.content[0].text;
+
+test("public wrapper mock satisfies the selected host contract before testing execution", async () => {
+  const h = makeHarness();
+  try {
+    h.tools.set("probe", { name:"probe", label:"probe", description:"probe", parameters:{type:"object"},
+      execute: async () => ({content:[{type:"text",text:"wrapper reached execute"}],details:{probe:true}}) });
+    const result = await h.protocol("probe", {});
+    assert.equal(result.isError, false, textOf(result));
+    assert.equal(result.details?.probe, true);
+  } finally { await h.emit("session_shutdown"); }
+});
 
 // Pure harness tests remain runnable on non-Windows CI.
 test("integration harness loads the TypeScript extension through jiti", () => {
@@ -460,7 +475,8 @@ test("lifecycle: explicit kill succeeds and injected trust-boundary failure is s
     else process.env.SystemRoot = previousRoot;
   }
   const killed = await harness.call("pwsh_job", { action: "kill", id: "bg-1" });
-  assert.match(textOf(killed), /Stopped bg-1/);
+  assert.match(textOf(killed), /termination requested/);
+  assert.equal(killed.structuredContent.stop_outcome, "termination_requested");
   await harness.emit("session_shutdown");
 });
 

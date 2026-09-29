@@ -176,7 +176,7 @@ export class JobList {
 		return [...this.jobs.values()]
 			.filter(
 				(j) =>
-					j.running ||
+					j.running || Boolean(j.outcome?.cleanupError) ||
 					j.id === this.viewingJobId ||
 					(j.endedAt != null && now - j.endedAt < FINISHED_LINGER_MS),
 			)

@@ -1,13 +1,13 @@
 # pi-pwsh-notify-secure
 
-Security-hardened fork of [oversk7/pi-pwsh-notify](https://github.com/oversk7/pi-pwsh-notify). Release `0.5.0-secure.5` selectively adapts upstream 0.5.0 reliability work without adopting its weaker executable resolution, execution-policy override, automatic output disclosure, or default complete-output logs.
+Security-hardened fork of [oversk7/pi-pwsh-notify](https://github.com/oversk7/pi-pwsh-notify). Release `0.5.0-secure.6` selectively adapts upstream 0.5.0 reliability work without adopting its weaker executable resolution, execution-policy override, automatic output disclosure, or default complete-output logs.
 
 English | [中文说明](#中文说明)
 
 Trusted PowerShell shell for [pi](https://pi.dev) on Windows (PowerShell 7 preferred, Windows PowerShell fallback), with **Claude Code-style background jobs that auto-notify the agent on completion** — no polling.
 
 ```
-pi install git:github.com/radioflyer28/pi-pwsh-notify-secure@v0.5.0-secure.5
+pi install git:github.com/radioflyer28/pi-pwsh-notify-secure@v0.5.0-secure.6
 ```
 
 ## Why
@@ -17,7 +17,7 @@ Pi 0.84.3 introduced an optional native `powershell` tool for ordinary foregroun
 1. Native Pi has no managed background jobs, persistent `cd`, blocking job wait, or ready/finished steering notifications.
 2. The native implementation examined at Pi 0.84.3 used unqualified executable discovery and cleanup helpers; this fork uses verified absolute executable paths and does not force `-ExecutionPolicy Bypass`.
 
-The peer floor remains Pi/TUI 0.84.3 after type-checking against that release. Development, integration tests, and extension smoke loading target Pi/TUI 0.87.1. See the [source-by-source Pi comparison](docs/research/pi-0.84.3-native-powershell.md), the [upstream 0.5.0 secure-adaptation matrix](docs/research/upstream-0.5.0-secure-adaptation.md), and the [upstream synchronization checklist](docs/maintenance/upstream-sync.md).
+The peer floor remains Pi/TUI 0.84.3. The isolated Windows compatibility matrix targets Pi/TUI 0.84.3, 0.87.1, and 0.99.1; the locked development dependency baseline remains Pi/TUI 0.87.1. Pi 0.99 adds structured codemode results without requiring a host upgrade for ordinary tool use. See the [source-by-source Pi comparison](docs/research/pi-0.84.3-native-powershell.md), the [upstream 0.5.0 secure-adaptation matrix](docs/research/upstream-0.5.0-secure-adaptation.md), and the [upstream synchronization checklist](docs/maintenance/upstream-sync.md).
 
 ### Symptoms this fixes
 
@@ -48,6 +48,32 @@ Two tools, Claude Code-shaped: background execution is a parameter, not a separa
 | --- | --- |
 | `pwsh` | Run a command (replaces built-in `bash`). `run_in_background: true` starts a job that **auto-notifies on exit**; `notify_on` (regex) adds a **ready notification** for servers that never exit |
 | `pwsh_job` | Background job management: incremental output / **blocking wait** (Claude Code's Monitor) / list / kill (`taskkill /T /F`) |
+
+### Structured results on Pi 0.99 (unreleased)
+
+The tools keep their default **direct** exposure and are callable from codemode while active. `outputSchema`/`structuredContent` provide discriminated results: `foreground`, `background`, `list`, `output`, `wait`, and `stop`. Older hosts continue receiving text and execution details; failed foreground commands still throw through the backward-compatible error hook.
+
+```javascript
+const result = await tools.pwsh({ command: "Write-Output hello; exit 3" });
+// Normal execution failures resolve to data in codemode; check execution status.
+if (result.execution.exit_code !== 0 || result.execution.timed_out ||
+    result.execution.aborted || result.execution.spawn_error || result.execution.cleanup_error) {
+  text({ execution: result.execution, output: result.output });
+}
+```
+
+Invalid input, blocked calls, and failures without structured data reject instead. Callers must handle both forms. Background launch returns `result.job.job_id`; launch success is not evidence of eventual process success.
+
+- `output` contains selected, newline-normalized stdout/stderr, without status prose or `(no output)` placeholders. It preserves whitespace. Text and structured output are generated from one bounded snapshot; no second output cursor read occurs.
+- `buffer_dropped_utf16` counts retained-tail eviction; `result_omitted_utf16` counts further output omitted from this result. Units are **UTF-16 code units**, not bytes. `unseen_lost` flags unread data evicted before a cursor read. `execution.output_incomplete` separately warns about capture ending before pipe closure.
+- Existing 400,000-code-unit retention and 2,000-line/50-KiB result limits remain; JSON escaping can require additional clipping. There is no larger codemode buffer and no `full_output_path`.
+- `cursor_from_utf16`/`cursor_to_utf16` describe consumption. Fetching output **consumes it even if a script never prints it**; `lines: 0` explicitly replays the bounded buffer and also advances the cursor. Omitted result data is consumed, too.
+- `wait_outcome` is `matched`, `exited`, `timeout`, or `aborted`. A wait timeout/abort does not stop the job or imply a process timeout. Inspect `job.execution` separately; it is `null` until execution settles.
+- `stop_outcome` distinguishes `termination_requested`, `capture_stopped`, and `already_finished`. None guarantees termination of independently detached descendants. Cleanup errors remain failures, not successful stops.
+- Lists return at most 100 jobs within the byte budget, with `omitted_jobs`; inspect a known job id directly when omitted. Reading a list does not consume output.
+- Await foreground calls. Codemode cancels unfinished calls when a script ends; a successfully launched background job intentionally survives script completion/failure and still belongs to the session.
+
+Keep process output out of automatic notifications. Redaction extensions must sanitize both `content` and `structuredContent` (and sensitive `details`); Pi 0.99 drops structured data when a hook replaces only text.
 
 ### Tool display
 
@@ -88,7 +114,7 @@ All timeouts are **seconds**, including the `BashOperations` adapter. Omitted ti
 
 When a shell exits but a descendant holds stdout/stderr open, capture settles after **250ms of pipe inactivity**, restarting that grace period on every output chunk. Normal EOF finishes immediately. Explicit results warn if capture ended with open pipes; late output after that boundary may be lost. A managed job represents the original shell, not every independently detached descendant. Keep servers in the foreground of the managed shell rather than daemonizing them. Continuous post-exit output keeps capture active, but an explicit execution timeout or cancellation still stops capture. After the parent exits, stopping capture cannot guarantee termination of independently detached descendants; it does not target the now-stale parent PID.
 
-The shared runner never writes output logs. **Pi itself owns the `!`/`!!` output consumer** and Pi 0.87.1 may spill large user-shell output to temporary `pi-bash-*.log` files. Use `pwsh`/`pwsh_job` when the extension's no-complete-output-log behavior is required. Normal Pi conversation persistence still applies to returned tool output.
+The shared runner never writes output logs. **Pi itself owns the `!`/`!!` output consumer** and Pi 0.87.1 may spill large user-shell output to temporary `pi-bash-*.log` files. Use `pwsh`/`pwsh_job` when the extension's no-complete-output-log behavior is required. Pi 0.99's codemode consumer can also spill oversized **printed script output** to disk, and `store()` persists values in the session. This extension cannot promise log-free behavior for host consumers or caller scripts. Normal Pi conversation persistence still applies to returned tool output.
 
 ## Built-in tool handling
 
@@ -113,7 +139,7 @@ The shared runner never writes output logs. **Pi itself owns the `!`/`!!` output
 
 ## Requirements
 
-- Pi/TUI 0.84.3 or newer on Windows; Pi/TUI 0.87.1 is the development and smoke-test target.
+- Pi/TUI 0.84.3 or newer on Windows; locked development baseline 0.87.1, with Windows compatibility targets 0.84.3 / 0.87.1 / 0.99.1.
 - PowerShell 7 (`pwsh`) is preferred — install with `winget install Microsoft.PowerShell`. Trusted Windows PowerShell 5.1 is retained as a fallback.
 
 ## Security hardening
@@ -122,6 +148,14 @@ The shared runner never writes output logs. **Pi itself owns the `!`/`!!` output
 - Automatic ready/finished steering messages contain metadata only. Commands, matched lines, stdout/stderr, and log paths are omitted; output must be retrieved explicitly and is identified to the agent as untrusted data.
 - Shells run with `-NoProfile -NonInteractive`; this fork does not force `-ExecutionPolicy Bypass`.
 - `pwsh`/`pwsh_job` and the shared runner create no full-output temporary logs. Pi's own `!`/`!!` consumer has separate retention behavior, described above.
+
+## Development checks
+
+Run `npm ci --ignore-scripts`, then `npm run check`. The codemode suite uses a local faux model provider with the real Pi AgentSession and QuickJS worker; it never calls a paid model. Codemode tests explicitly skip on pre-0.99 hosts; the Windows process integration suite still runs there.
+
+Use `npm run test:host -- --version 0.84.3` (also `0.87.1` or `0.99.1`) for an isolated pinned-host check. It does not alter this checkout's dependencies or installed Pi, and respects npm's release-age policy. The runner verifies host/TUI versions, shares Pi's bundled TUI registry, and retains its temporary fixture lock and evidence. Replay its full transitive dependency set with `--lock <saved-host-package-lock.json>`; the checkout's lockfile pins the shared development tools. CI runs all three on Windows and uploads fixture locks for replay.
+
+`--installed <absolute-Pi-package-directory>` instead tests an already-installed matching host without downloading packages; this is labeled an **installed-host smoke test**, not a clean-install test. Neither path changes the configured Pi package tag. See [Pi 0.99 assessment](docs/research/pi-0.99-package-assessment.md) for the migration rationale.
 
 ## Notes
 
@@ -135,7 +169,7 @@ The shared runner never writes output logs. **Pi itself owns the `!`/`!!` output
 Windows 下给 [pi](https://pi.dev) 用的 PowerShell 7 shell，带 Claude Code 风格的后台任务：**任务结束后自动通知 agent，无需轮询**。
 
 ```
-pi install git:github.com/radioflyer28/pi-pwsh-notify-secure@v0.5.0-secure.5
+pi install git:github.com/radioflyer28/pi-pwsh-notify-secure@v0.5.0-secure.6
 ```
 
 ### 它解决的问题

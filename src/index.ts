@@ -33,8 +33,6 @@ import { resolve as resolvePath } from "node:path";
 import {
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
-	formatSize,
-	truncateTail,
 	type BashOperations,
 	type ExtensionAPI,
 	type ExtensionContext,
@@ -50,6 +48,8 @@ import {
 } from "./execution.js";
 import type { PowerShellRuntime } from "./security.js";
 import { activeToolsForPowerShell } from "./tool-selection.js";
+import { jobStatus, jobStatusText as statusOf } from "./job-status.js";
+import { executionData, jobData, jobOutputSchema, outputSnapshot, pwshOutputSchema, structuredResult, type PwshResult } from "./results.js";
 import { JobList, type JobListUICtx } from "./ui/job-list.js";
 import {
 	renderPowerShellResult,
@@ -92,6 +92,7 @@ export interface BgJob {
 	running: boolean;
 	settling: boolean;
 	killedByTool: boolean;
+	stopKind?: "termination_requested" | "capture_stopped";
 	timedOut: boolean;
 	readyNotified: boolean;
 	/** Callbacks invoked on every output chunk and on exit; used by `wait`. */
@@ -123,34 +124,8 @@ function fmtDuration(ms: number): string {
 	return `${m}m${s % 60}s`;
 }
 
-function tailLines(text: string, n: number): string {
-	const lines = text.split("\n");
-	return lines.length <= n ? text : lines.slice(-n).join("\n");
-}
-
 function tailChars(text: string, n: number): string {
 	return text.length <= n ? text : text.slice(text.length - n);
-}
-
-function boundedTail(text: string, maxLines = DEFAULT_MAX_LINES): string {
-	const lineBudget = Math.max(1, Math.min(DEFAULT_MAX_LINES - 1, maxLines));
-	const truncation = truncateTail(text, {
-		maxBytes: Math.max(1, DEFAULT_MAX_BYTES - 256),
-		maxLines: lineBudget,
-	});
-	if (!truncation.truncated) return truncation.content;
-	return `[output truncated: showing ${truncation.outputLines} of ${truncation.totalLines} lines, ${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}]\n${truncation.content}`;
-}
-
-function boundedResult(prefix: string, body: string, maxBodyLines = DEFAULT_MAX_LINES): string {
-	const prefixLines = prefix ? prefix.split("\n").length : 0;
-	const byteBudget = Math.max(1, DEFAULT_MAX_BYTES - Buffer.byteLength(prefix, "utf8") - 258);
-	const lineBudget = Math.max(1, Math.min(maxBodyLines, DEFAULT_MAX_LINES - prefixLines - 1));
-	const truncation = truncateTail(body, { maxBytes: byteBudget, maxLines: lineBudget });
-	const marker = truncation.truncated
-		? `[output truncated: showing ${truncation.outputLines} of ${truncation.totalLines} lines, ${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}]`
-		: "";
-	return [prefix, marker, truncation.content].filter(Boolean).join("\n");
 }
 
 function samePath(left: string, right: string): boolean {
@@ -159,32 +134,27 @@ function samePath(left: string, right: string): boolean {
 	return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
 }
 
-function statusOf(job: BgJob): string {
-	if (job.killedByTool) return "stopped";
-	if (job.outcome?.cleanupError) return "cleanup failed (process may still be running)";
-	if (job.outcome?.spawnError) return "spawn failed";
-	if (job.running) return "running";
-	if (job.timedOut) return "timeout (termination requested)";
-	return `exited ${job.exitCode}`;
-}
-
 function textResult(text: string) {
 	return { content: [{ type: "text" as const, text }], details: undefined };
 }
 
 interface CursorRead {
 	text: string;
+	buffer: string;
 	missed: boolean;
+	from: number;
+	to: number;
+	dropped: number;
 }
 
 /** Atomically read-and-advance an absolute output cursor. */
 function consumeCursor(job: BgJob): Promise<CursorRead> {
 	const next = job.mutex.then(() => {
-		const missed = job.cursor < job.baseOffset;
-		const relativeStart = Math.max(0, job.cursor - job.baseOffset);
-		const text = job.output.slice(relativeStart);
+		const from = job.cursor;
+		const missed = from < job.baseOffset;
+		const text = job.output.slice(Math.max(0, from - job.baseOffset));
 		job.cursor = job.baseOffset + job.output.length;
-		return { text, missed };
+		return { text, buffer: job.output, missed, from, to: job.cursor, dropped: job.baseOffset };
 	});
 	job.mutex = next.then(
 		() => undefined,
@@ -226,8 +196,7 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 	// left to pi-subagents' fleet view so both lists can coexist.)
 	const jobList = new JobList(jobs, (job) => {
 		try {
-			job.stop();
-			job.killedByTool = true;
+			stopJob(job);
 		} catch (error) {
 			uiCtx?.ui.notify(`Failed to kill ${job.id}: ${String(error)}`, "error");
 		}
@@ -235,19 +204,33 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 	// Foreground pwsh calls serialize here (see the foreground branch below).
 	let foregroundChain: Promise<void> = Promise.resolve();
 	const executions = new Set<Execution>();
-	const failedResults = new Map<string, ExecutionOutcome>();
-	// Pi marks thrown tool executions as errors; enrich that error result with metadata.
+	const failedResults = new Map<string, { details: ExecutionOutcome; structuredContent: PwshResult; text: string }>();
+	// Keep throwing for legacy hosts. Pi 0.99 also preserves schema-backed data supplied by this hook.
 	pi.on("tool_result", (event) => {
 		if (event.toolName !== "pwsh") return;
-		const details = failedResults.get(event.toolCallId);
+		const failed = failedResults.get(event.toolCallId);
 		failedResults.delete(event.toolCallId);
-		if (details) return { details };
+		// Do not restore output an earlier permission/redaction extension already replaced.
+		if (failed && event.content.length === 1 && event.content[0].type === "text" && event.content[0].text === failed.text) {
+			return { details: failed.details, structuredContent: failed.structuredContent };
+		}
 	});
+	function stopJob(job: BgJob): "termination_requested" | "capture_stopped" {
+		const kind = job.proc.exitCode != null || job.proc.signalCode != null ? "capture_stopped" : "termination_requested";
+		job.stop(); // Failure must not set a successful stop flag.
+		job.stopKind = kind;
+		job.killedByTool = true;
+		notifications.cancel(job.id);
+		return kind;
+	}
 	function launch(options: Parameters<typeof startExecution>[0], toolCallId?: string): Execution {
 		let execution: Execution;
 		try { execution = startExecution(options); }
 		catch (error) {
-			if (toolCallId && error instanceof ExecutionLaunchError) failedResults.set(toolCallId, error.outcome);
+			if (toolCallId && error instanceof ExecutionLaunchError) failedResults.set(toolCallId, {
+				details: error.outcome, text: error.message,
+				structuredContent: { kind: "foreground", ...outputSnapshot("").data, execution: executionData(error.outcome), elapsed_seconds: 0 },
+			});
 			throw error;
 		}
 		executions.add(execution);
@@ -521,7 +504,7 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 			job,
 			"background-job-finished",
 			status,
-			!job.timedOut && !job.killedByTool && job.exitCode === 0,
+			jobStatus(job).ok,
 			dur,
 		);
 	}
@@ -545,6 +528,7 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "pwsh",
 		label: "pwsh",
+		...{ outputSchema: pwshOutputSchema }, // Additive on 0.99; ignored by older hosts.
 		description:
 			`Run a non-interactive PowerShell command on Windows (PowerShell 7 preferred, trusted Windows PowerShell fallback); returns combined stdout/stderr. cd persists between calls; variables and functions do not, so chain dependent steps in one command. Foreground timeout defaults to ${FG_DEFAULT_TIMEOUT_SEC}s. Use run_in_background for servers, watchers, builds, and other long-running commands; it returns a job id and sends metadata-only ready/finished notifications. Use notify_on for a one-time ready match. Retrieve output with pwsh_job output or wait.`,
 		promptSnippet: "Run PowerShell commands; supports managed background jobs",
@@ -631,8 +615,6 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 					mutex: Promise.resolve(),
 				};
 				void execution.done.then((result) => {
-					const notes = executionNotes(result);
-					if (notes.length) execution.output.append(`\n[${notes.join("; ")}]\n`);
 					job.output = execution.output.text;
 					job.baseOffset = execution.output.droppedChars;
 					job.truncated = job.baseOffset > 0;
@@ -650,10 +632,11 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 				});
 				jobs.set(id, job);
 				updateRunningStatus();
-				return textResult(
+				return structuredResult(
 					`Started background job ${id}${params.name ? ` (${params.name})` : ""}, PID ${proc.pid}. You will be notified automatically${
 						readyRegex ? " when the output matches notify_on and" : ""
 					} when it finishes.`,
+					{ kind: "background", job: jobData(job) },
 				);
 			}
 
@@ -664,6 +647,7 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 				if (shutdown) throw new Error("session is shutting down");
 				if (currentCwd && !existsSync(currentCwd)) currentCwd = undefined;
 				const cwd = currentCwd ?? ctx.cwd;
+				const startedAt = Date.now();
 				const updates = outputUpdates(() => onUpdate?.(textResult(tailChars(execution.output.text, FG_LIVE_PREVIEW_CHARS))));
 				const execution = launch({
 					executable: detected.executable, command: params.command, cwd, env: buildToolEnv(ctx),
@@ -678,12 +662,13 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 					if (!samePath(result.cwd, cwd)) notes.push(`cwd is now ${result.cwd}`);
 					currentCwd = resolvePath(result.cwd);
 				}
-				const text = boundedTail([execution.output.text.trim(), ...notes].filter(Boolean).join("\n\n") || "(no output)");
+				const snapshot = outputSnapshot(execution.output.text, { notes, dropped: result.droppedChars });
+				const data: PwshResult = { kind: "foreground", ...snapshot.data, execution: executionData(result), elapsed_seconds: (Date.now() - startedAt) / 1000 };
 				if (executionFailed(result)) {
-					failedResults.set(_toolCallId, result);
-					throw new Error(text);
+					failedResults.set(_toolCallId, { details: result, structuredContent: data, text: snapshot.text });
+					throw new Error(snapshot.text);
 				}
-				return { ...textResult(text), details: result };
+				return structuredResult(snapshot.text, data, result);
 			});
 		},
 	});
@@ -694,6 +679,7 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "pwsh_job",
 		label: "pwsh_job",
+		...{ outputSchema: jobOutputSchema },
 		description:
 			'Manage jobs started by pwsh background mode. output returns unseen output (lines: 0 means the bounded buffer); wait blocks for an unseen regex match, process exit, abort, or timeout; list shows jobs; kill terminates the process tree without a completion notification. Prefer wait over polling when work depends on the result.',
 		promptSnippet: "Inspect, wait for, list, or kill pwsh background jobs",
@@ -722,12 +708,18 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 			const waitTimeoutMs = timeoutMilliseconds(params.timeout, WAIT_DEFAULT_TIMEOUT_SEC);
 			if (signal?.aborted) throw new Error("job operation aborted");
 			if (params.action === "list") {
-				if (jobs.size === 0) return textResult("No background jobs this session.");
-				const rows = [...jobs.values()].map((j) => {
-					const cmd = j.command.length > 80 ? `${j.command.slice(0, 80)}…` : j.command;
-					return `${j.id}${j.name ? ` (${j.name})` : ""} — ${statusOf(j)} — ${cmd}`;
-				});
-				return textResult(rows.join("\n"));
+				// Bound the complete serialized list as well as its human representation.
+				const selected: ReturnType<typeof jobData>[] = [];
+				const rows: string[] = [];
+				for (const j of jobs.values()) {
+					const data = jobData(j);
+					const row = `${j.id}${j.name ? ` (${j.name.slice(0, 80)})` : ""} — ${statusOf(j)} — ${j.command.slice(0, 80)}`;
+					if (selected.length >= 100 || Buffer.byteLength(JSON.stringify([...selected, data]), "utf8") > DEFAULT_MAX_BYTES - 1024) break;
+					selected.push(data); rows.push(row);
+				}
+				const omitted = jobs.size - selected.length;
+				return structuredResult([rows.join("\n") || "No background jobs this session.", omitted ? `[${omitted} jobs omitted]` : ""].filter(Boolean).join("\n"),
+					{ kind: "list", jobs: selected, omitted_jobs: omitted });
 			}
 			const job = params.id ? jobs.get(params.id) : undefined;
 			if (!job) {
@@ -739,11 +731,11 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 				notifications.cancel(job.id);
 				if (!job.running && !job.outcome?.cleanupError) {
 					job.terminalObserved = true;
-					return textResult(`${job.id} already finished (${statusOf(job)}).`);
+					return structuredResult(`${job.id} already finished (${statusOf(job)}).`, { kind: "stop", job: jobData(job), stop_outcome: "already_finished" });
 				}
-				job.stop();
-				job.killedByTool = true;
-				return textResult(`Stopped ${job.id} (PID ${job.proc.pid}); independently detached descendants may remain.`);
+				const stop_outcome = stopJob(job);
+				return structuredResult(`Stopped capture or requested termination for ${job.id} (PID ${job.proc.pid}): ${statusOf(job)}; independently detached descendants may remain.`,
+					{ kind: "stop", job: jobData(job), stop_outcome });
 			}
 			if (params.action === "wait") {
 				let regex: RegExp | undefined;
@@ -804,25 +796,27 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 							: outcome === "timeout"
 								? `${job.id} — wait timed out after ${timeoutSec}s, job still ${statusOf(job)} (runtime ${dur})`
 								: `${job.id} — wait aborted, job still ${statusOf(job)}`;
-				const body = tailLines(fresh.text, WAIT_TAIL_LINES).trim() || "(no output)";
 				const warning = fresh.missed ? "[warning: unseen output rolled out of the in-memory buffer]\n" : "";
-				return { ...textResult(boundedResult(`${head}\n${warning}--- output since last check ---`, body, WAIT_TAIL_LINES)), details: job.outcome };
+				const snapshot = outputSnapshot(fresh.text, { prefix: `${head}\n${warning}--- output since last check ---`, maxLines: WAIT_TAIL_LINES,
+					dropped: fresh.dropped, missed: fresh.missed, notes: job.outcome ? executionNotes(job.outcome) : [] });
+				return structuredResult(snapshot.text, { kind: "wait", job: jobData(job), ...snapshot.data,
+					cursor_from_utf16: fresh.from, cursor_to_utf16: fresh.to, wait_outcome: outcome }, job.outcome);
 			}
 			// action === "output": incremental since the previous check
 			observeJobState(job, true);
 			const requestedLines = Math.max(0, Math.floor(params.lines ?? 100));
 			const fresh = await consumeCursor(job);
-			const bodySource = requestedLines === 0 ? job.output : tailLines(fresh.text, requestedLines);
-			const body = bodySource.trim() || (requestedLines === 0 ? "(no output)" : "(no new output since last check)");
+			const bodySource = requestedLines === 0 ? fresh.buffer : fresh.text;
 			const dur = fmtDuration((job.endedAt ?? Date.now()) - job.startedAt);
 			const head = `${job.id} — ${statusOf(job)}, ${job.running ? "running for" : "ran"} ${dur}${
 				job.truncated ? " (buffer truncated, oldest output dropped)" : ""
 			}${requestedLines === 0 ? "" : fresh.text ? ", new output since last check:" : ""}`;
 			const warning = fresh.missed ? "[warning: unseen output rolled out of the in-memory buffer]" : "";
-			return {
-				...textResult(boundedResult([head, warning].filter(Boolean).join("\n"), body, requestedLines === 0 ? DEFAULT_MAX_LINES : requestedLines)),
-				details: job.outcome,
-			};
+			const snapshot = outputSnapshot(bodySource, { prefix: [head, warning].filter(Boolean).join("\n"),
+				maxLines: requestedLines === 0 ? DEFAULT_MAX_LINES : requestedLines, dropped: fresh.dropped, missed: fresh.missed,
+				notes: job.outcome ? executionNotes(job.outcome) : [] });
+			return structuredResult(snapshot.text, { kind: "output", job: jobData(job), ...snapshot.data,
+				cursor_from_utf16: fresh.from, cursor_to_utf16: fresh.to, replay: requestedLines === 0 }, job.outcome);
 		},
 	});
 }

@@ -1,4 +1,5 @@
 node_modules/
 *.tgz
 *.log
-test/
+test/*
+!test/codemode.test.mts

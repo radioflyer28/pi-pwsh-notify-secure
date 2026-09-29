@@ -104,6 +104,9 @@ test("pwsh and pwsh_job register display-only custom renderers", () => {
 		assert.equal(typeof tool.renderCall, "function");
 		assert.equal(typeof tool.renderResult, "function");
 		assert.notEqual(tool.renderShell, "self");
+		assert.ok(tool.outputSchema);
+		assert.ok(tool.exposure === undefined || tool.exposure === "direct");
+		assert.equal(tool.annotations, undefined); // Missing hints remain conservative; never label arbitrary shell actions read-only.
 	}
 });
 
