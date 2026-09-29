@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { createRequire } from "node:module";
 import { setTimeout as sleep } from "node:timers/promises";
-import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@earendil-works/pi-coding-agent";
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, wrapRegisteredTool } from "@earendil-works/pi-coding-agent";
 
 process.setMaxListeners(100);
 
@@ -82,8 +82,25 @@ function makeHarness(options: HarnessOptions = {}) {
       for (const handler of eventHandlers.get(event) ?? []) results.push(await handler(payload, ctx));
       return results;
     },
-    call(tool: string, params: Record<string, unknown>, signal?: AbortSignal) {
-      return tools.get(tool).execute("test-call", params, signal, undefined, ctx);
+    call(tool: string, params: Record<string, unknown>, signal?: AbortSignal, onUpdate?: (result: any) => void) {
+      return tools.get(tool).execute("test-call", params, signal, onUpdate, ctx);
+    },
+    // Match AgentSession's afterToolCall contract: thrown execution is an error;
+    // tool_result hooks may attach details but must not turn it back into success.
+    async protocol(tool: string, params: Record<string, unknown>, signal?: AbortSignal) {
+      let result: any;
+      let isError = false;
+      const wrapped = wrapRegisteredTool({ definition: tools.get(tool) } as any, { createContext: () => ctx } as any);
+      try { result = await wrapped.execute("protocol-call", params, signal); }
+      catch (error) {
+        isError = true;
+        result = { content: [{ type: "text", text: (error as Error).message }], details: undefined };
+      }
+      for (const handler of eventHandlers.get("tool_result") ?? []) {
+        const change = await handler({ type: "tool_result", toolName: tool, toolCallId: "protocol-call", input: params, ...result, isError }, ctx);
+        if (change) result = { ...result, ...change as object };
+      }
+      return { ...result, isError };
     },
   };
 }
@@ -151,14 +168,14 @@ test("user shell: secure operations execute and persist cwd", { skip: process.pl
   let firstOutput = "";
   const first = await operations.exec(`Set-Location '${escaped}'; Write-Output shortcut`, REPO, {
     onData: (chunk: Buffer) => { firstOutput += chunk.toString("utf8"); },
-    timeout: 5_000,
+    timeout: 5,
   });
   assert.equal(first.exitCode, 0);
   assert.match(firstOutput, /shortcut/);
   let secondOutput = "";
   await operations.exec("$PWD.Path", REPO, {
     onData: (chunk: Buffer) => { secondOutput += chunk.toString("utf8"); },
-    timeout: 5_000,
+    timeout: 5,
   });
   assert.match(secondOutput, new RegExp(dir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"));
   harness.fire("session_shutdown");
@@ -171,8 +188,10 @@ test("user shell: timeout and abort terminate commands", { skip: process.platfor
   const operations = (results.find((result: any) => result?.operations) as any)?.operations;
   assert.ok(operations);
   const started = Date.now();
-  const timed = await operations.exec("Start-Sleep -Seconds 30", REPO, { onData() {}, timeout: 500 });
+  let timeoutOutput = "";
+  const timed = await operations.exec("Start-Sleep -Seconds 30", REPO, { onData(chunk: Buffer) { timeoutOutput += chunk.toString(); }, timeout: 0.5 });
   assert.notEqual(timed.exitCode, 0);
+  assert.match(timeoutOutput, /timed out/);
   assert.ok(Date.now() - started < 5_000);
   const controller = new AbortController();
   const pending = operations.exec("Start-Sleep -Seconds 30", REPO, {
@@ -232,12 +251,16 @@ test("windows runtime: foreground transports long source and UTF-8", { skip: pro
 
 test("windows runtime: native and cmdlet exit outcomes are correct", { skip: process.platform !== "win32" }, async () => {
   const nativeHarness = makeHarness();
-  const native = await nativeHarness.call("pwsh", { command: `cmd /c "exit 3"` });
+  const native = await nativeHarness.protocol("pwsh", { command: `cmd /c "exit 3"` });
+  assert.equal(native.isError, true);
+  assert.equal(native.details.exitCode, 3);
   assert.match(textOf(native), /exit code: 3/);
   nativeHarness.fire("session_shutdown");
 
   const cmdletHarness = makeHarness();
-  const cmdlet = await cmdletHarness.call("pwsh", { command: "Get-Item 'C:\\definitely-missing-pi-pwsh-notify'" });
+  const cmdlet = await cmdletHarness.protocol("pwsh", { command: "Get-Item 'C:\\definitely-missing-pi-pwsh-notify'" });
+  assert.equal(cmdlet.isError, true);
+  assert.equal(cmdlet.details.exitCode, 1);
   assert.match(textOf(cmdlet), /exit code: 1/);
   cmdletHarness.fire("session_shutdown");
 
@@ -272,15 +295,19 @@ test("windows runtime: foreground cwd persists and concurrent calls serialize", 
 
 test("windows runtime: timeout and abort clean up foreground processes", { skip: process.platform !== "win32" }, async () => {
   const timeoutHarness = makeHarness();
-  const timed = await timeoutHarness.call("pwsh", { command: "Start-Sleep -Seconds 30", timeout: 1 });
+  const timed = await timeoutHarness.protocol("pwsh", { command: "Start-Sleep -Seconds 30", timeout: 1 });
+  assert.equal(timed.isError, true);
+  assert.equal(timed.details.timedOut, true);
   assert.match(textOf(timed), /timed out/);
   timeoutHarness.fire("session_shutdown");
 
   const abortHarness = makeHarness();
   const controller = new AbortController();
-  const pending = abortHarness.call("pwsh", { command: "Start-Sleep -Seconds 30" }, controller.signal);
+  const pending = abortHarness.protocol("pwsh", { command: "Start-Sleep -Seconds 30" }, controller.signal);
   setTimeout(() => controller.abort(), 500);
   const aborted = await pending;
+  assert.equal(aborted.isError, true);
+  assert.equal(aborted.details.aborted, true);
   assert.match(textOf(aborted), /aborted/);
   abortHarness.fire("session_shutdown");
 });
@@ -433,7 +460,7 @@ test("lifecycle: explicit kill succeeds and injected trust-boundary failure is s
     else process.env.SystemRoot = previousRoot;
   }
   const killed = await harness.call("pwsh_job", { action: "kill", id: "bg-1" });
-  assert.match(textOf(killed), /Killed bg-1/);
+  assert.match(textOf(killed), /Stopped bg-1/);
   await harness.emit("session_shutdown");
 });
 
@@ -562,4 +589,194 @@ test("background cursors: concurrent reads do not report output twice", { skip: 
   assert.ok(left.length + right.length > 0);
   await harness.call("pwsh_job", { action: "kill", id: "bg-1" });
   harness.fire("session_shutdown");
+});
+
+test("execution stress: 32 MiB foreground output stays bounded, coalesces updates, and retains cwd", { skip: process.platform !== "win32" }, async (t) => {
+  const harness = makeHarness();
+  const updates: Array<{ time: number; text: string }> = [];
+  const dir = (process.env.TEMP ?? REPO).replace(/\\$/, "");
+  const start = Date.now();
+  const rssBefore = process.memoryUsage().rss;
+  const result = await harness.call("pwsh", {
+    command: `$s = 'x' * 8192; for ($i=0; $i -lt 4096; $i++) { [Console]::Out.WriteLine($s) }; Set-Location '${dir.replaceAll("'", "''")}'; Write-Output FINAL_STRESS_TAIL`,
+    timeout: 30,
+  }, undefined, (update) => updates.push({ time: Date.now(), text: textOf(update) }));
+  const elapsed = Date.now() - start;
+  assert.ok(result.details.droppedChars > 30_000_000);
+  assert.match(textOf(result), /FINAL_STRESS_TAIL/);
+  assert.match(textOf(result), /output truncated/);
+  assert.ok(Buffer.byteLength(textOf(result)) <= DEFAULT_MAX_BYTES);
+  assert.ok(updates.every((update) => update.text.length <= 4000));
+  assert.ok(updates.length <= Math.ceil(elapsed / 100) + 2);
+  assert.match(updates.at(-1)!.text, /FINAL_STRESS_TAIL/);
+  assert.ok(updates.every((update) => !update.text.includes("pwsh-cwd:")));
+  const next = await harness.call("pwsh", { command: "$PWD.Path" });
+  assert.match(textOf(next), new RegExp(dir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"));
+  const count = updates.length;
+  await sleep(150);
+  assert.equal(updates.length, count);
+  t.diagnostic(JSON.stringify({ bytesProduced: 4096 * 8193, elapsedMs: elapsed, updates: count,
+    droppedChars: result.details.droppedChars, rssDeltaBytes: process.memoryUsage().rss - rssBefore }));
+  await harness.emit("session_shutdown");
+});
+
+test("user shell streams before completion, strips cwd records, and shares the foreground queue", { skip: process.platform !== "win32" }, async () => {
+  const harness = makeHarness();
+  harness.fire("session_start");
+  const [{ operations }] = await harness.emit("user_bash") as any;
+  let finished = false;
+  let early = false;
+  let earlyAt = 0;
+  let text = "";
+  const pending = operations.exec("Write-Output EARLY; Start-Sleep -Milliseconds 500; Write-Output FINAL", REPO, {
+    onData(chunk: Buffer) {
+      text += chunk.toString();
+      if (text.includes("EARLY") && !text.includes("FINAL") && !finished && !early) {
+        early = true;
+        earlyAt = Date.now();
+      }
+    },
+    timeout: 5,
+  }).then((result: any) => { finished = true; return result; });
+  assert.equal((await pending).exitCode, 0);
+  assert.equal(early, true);
+  assert.ok(Date.now() - earlyAt >= 300, "EARLY must stream while the command is still sleeping");
+  assert.match(text, /EARLY[\s\S]*FINAL/);
+  assert.doesNotMatch(text, /pwsh-cwd:/);
+  const dir = (process.env.TEMP ?? REPO).replace(/\\$/, "");
+  const user = operations.exec(`Set-Location '${dir.replaceAll("'", "''")}'; Start-Sleep -Milliseconds 200`, REPO, { onData() {} });
+  const tool = harness.call("pwsh", { command: "$PWD.Path" });
+  await user;
+  assert.match(textOf(await tool), new RegExp(dir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"));
+  await harness.emit("session_shutdown");
+});
+
+function inheritedPipeCommand(quiet: boolean): string {
+  const childCode = quiet
+    ? "setTimeout(() => process.exit(0), 2500)"
+    : "let n=0; const t=setInterval(() => { console.log('LATE_'+n); if (++n===10) {clearInterval(t); console.log('DESCENDANT_FINAL');} }, 80)";
+  const parentCode = `const {spawn}=require('node:child_process'); const c=spawn(process.execPath,['-e',${JSON.stringify(childCode)}],{stdio:['ignore','inherit','inherit'],detached:true}); c.unref(); console.log('PARENT_DONE');`;
+  return `& '${process.execPath.replaceAll("'", "''")}' -e '${parentCode.replaceAll("'", "''")}'`;
+}
+
+test("inherited pipes: foreground and background retain actively arriving post-exit output", { skip: process.platform !== "win32" }, async () => {
+  for (const run_in_background of [false, true]) {
+    const harness = makeHarness();
+    try {
+      let result = await harness.call("pwsh", { command: inheritedPipeCommand(false), run_in_background });
+      if (run_in_background) result = await harness.call("pwsh_job", { action: "wait", id: "bg-1", timeout: 5 });
+      assert.match(textOf(result), /PARENT_DONE/);
+      assert.match(textOf(result), /LATE_9/);
+      assert.match(textOf(result), /DESCENDANT_FINAL/);
+      if (!run_in_background) assert.equal(result.details.outputIncomplete, false);
+      await sleep(350);
+      assert.equal(harness.messages.length, 0, "wait observes terminal state without duplicate notification");
+    } finally { await harness.emit("session_shutdown"); }
+  }
+});
+
+test("inherited pipes: quiet descendant cannot hold foreground, background wait or user shell open", { skip: process.platform !== "win32" }, async (t) => {
+  for (const mode of ["foreground", "background", "user"]) {
+    const harness = makeHarness();
+    harness.fire("session_start");
+    const start = Date.now();
+    try {
+      let text: string;
+      if (mode === "user") {
+        const [{ operations }] = await harness.emit("user_bash") as any;
+        text = "";
+        await operations.exec(inheritedPipeCommand(true), REPO, { onData(chunk: Buffer) { text += chunk.toString(); } });
+      } else {
+        let result = await harness.call("pwsh", { command: inheritedPipeCommand(true), run_in_background: mode === "background" });
+        if (mode === "background") result = await harness.call("pwsh_job", { action: "wait", id: "bg-1", timeout: 5 });
+        text = textOf(result);
+      }
+      const elapsed = Date.now() - start;
+      assert.match(text, /PARENT_DONE/);
+      assert.match(text, /output capture ended/);
+      assert.ok(elapsed < 2400, `${mode} took ${elapsed}ms (descendant holds pipes for 2500ms after startup)`);
+      t.diagnostic(`${mode}: settled in ${elapsed}ms`);
+    } finally { await harness.emit("session_shutdown"); }
+  }
+});
+
+test("user-shell stress: 16 MiB streams to the caller without buffering the complete transcript", { skip: process.platform !== "win32" }, async (t) => {
+  const harness = makeHarness();
+  const [{ operations }] = await harness.emit("user_bash") as any;
+  let bytes = 0;
+  let chunks = 0;
+  let tail = "";
+  let leakedMarker = false;
+  const start = Date.now();
+  try {
+    const result = await operations.exec("$s = 'u' * 8192; for ($i=0; $i -lt 2048; $i++) { [Console]::Out.WriteLine($s) }; Write-Output USER_STRESS_FINAL", REPO, {
+      timeout: 30,
+      onData(chunk: Buffer) {
+        bytes += chunk.length;
+        chunks++;
+        const text = chunk.toString();
+        leakedMarker ||= text.includes("pwsh-cwd:");
+        tail = (tail + text).slice(-100);
+      },
+    });
+    assert.equal(result.exitCode, 0);
+    assert.ok(bytes > 16_000_000);
+    assert.ok(chunks > 10);
+    assert.match(tail, /USER_STRESS_FINAL/);
+    assert.equal(leakedMarker, false);
+    t.diagnostic(JSON.stringify({ userShellBytes: bytes, chunks, elapsedMs: Date.now() - start }));
+  } finally { await harness.emit("session_shutdown"); }
+});
+
+test("protocol cancellation before a queued launch carries structured abort details", { skip: process.platform !== "win32" }, async () => {
+  const harness = makeHarness();
+  const first = harness.call("pwsh", { command: "Start-Sleep -Milliseconds 400; Write-Output FIRST" });
+  const controller = new AbortController();
+  const second = harness.protocol("pwsh", { command: "Write-Output SHOULD_NOT_RUN" }, controller.signal);
+  controller.abort();
+  await first;
+  const result = await second;
+  assert.equal(result.isError, true);
+  assert.equal(result.details.aborted, true);
+  assert.match(textOf(result), /aborted before launch/);
+  assert.doesNotMatch(textOf(result), /SHOULD_NOT_RUN/);
+  const success = await harness.protocol("pwsh", { command: "Write-Output RECOVERY" });
+  assert.equal(success.isError, false);
+  assert.equal(success.details.aborted, false);
+  await harness.emit("session_shutdown");
+});
+
+test("timeout validation applies to foreground, background, wait and user operations", { skip: process.platform !== "win32" }, async () => {
+  const harness = makeHarness();
+  const [{ operations }] = await harness.emit("user_bash") as any;
+  for (const timeout of [-1, NaN, Infinity, 2147483.648]) {
+    for (const run_in_background of [false, true]) {
+      await assert.rejects(harness.call("pwsh", { command: "Write-Output SHOULD_NOT_RUN", timeout, run_in_background }), /Invalid timeout/);
+    }
+    await assert.rejects(harness.call("pwsh_job", { action: "wait", id: "missing", timeout }), /Invalid timeout/);
+    assert.throws(() => operations.exec("", REPO, { timeout, onData() {} }), /Invalid timeout/);
+  }
+  const result = await harness.call("pwsh", { command: "Write-Output unlimited", timeout: 0 });
+  assert.match(textOf(result), /unlimited/);
+  assert.match(textOf(await harness.call("pwsh_job", { action: "list" })), /No background jobs/);
+  await harness.emit("session_shutdown");
+});
+
+test("protocol failure retains output and structured cleanup failure, then retries cleanup at shutdown", { skip: process.platform !== "win32" }, async () => {
+  const harness = makeHarness();
+  harness.fire("session_start");
+  const previous = process.env.SystemRoot;
+  try {
+    const pending = harness.protocol("pwsh", { command: "Write-Output RETAINED_DIAGNOSTIC; Start-Sleep -Seconds 30", timeout: 2 });
+    process.env.SystemRoot = String.raw`Z:\missing-windows-for-cleanup-test`;
+    const result = await pending;
+    assert.equal(result.isError, true);
+    assert.equal(result.details.timedOut, true);
+    assert.match(result.details.cleanupError, /taskkill/);
+    assert.match(textOf(result), /RETAINED_DIAGNOSTIC/);
+    assert.match(textOf(result), /cleanup error/);
+  } finally {
+    if (previous === undefined) delete process.env.SystemRoot; else process.env.SystemRoot = previous;
+    await harness.emit("session_shutdown");
+  }
 });

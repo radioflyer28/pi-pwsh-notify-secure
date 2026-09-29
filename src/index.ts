@@ -30,7 +30,6 @@
 import type { ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
-import { StringDecoder } from "node:string_decoder";
 import {
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
@@ -44,7 +43,11 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { NotificationQueue, type NotificationKind } from "./notification-queue.js";
 import { AUTOMATED_NOTE, jobNotificationMetadata } from "./notifications.js";
-import { buildPowerShellScript, killProcessTree, resolvePowerShellRuntime, spawnPowerShell } from "./runtime.js";
+import { resolvePowerShellRuntime } from "./runtime.js";
+import {
+	executionFailed, executionNotes, ExecutionLaunchError, outputUpdates, startExecution, timeoutMilliseconds,
+	type Execution, type ExecutionOutcome,
+} from "./execution.js";
 import type { PowerShellRuntime } from "./security.js";
 import { activeToolsForPowerShell } from "./tool-selection.js";
 import { JobList, type JobListUICtx } from "./ui/job-list.js";
@@ -56,15 +59,10 @@ import {
 
 const FG_DEFAULT_TIMEOUT_SEC = 120;
 const FG_LIVE_PREVIEW_CHARS = 4_000;
-const BG_MAX_BUFFER_CHARS = 400_000;
 const WAIT_DEFAULT_TIMEOUT_SEC = 120;
 const WAIT_TAIL_LINES = 100;
 /** customType used for job notifications + their TUI renderer. */
 const NOTIFY_TYPE = "pwsh-bg-notify";
-/** Marker line appended to foreground scripts to report the final $PWD; the
- * leading SOH control char makes collisions with real output practically
- * impossible. */
-const CWD_MARKER = String.fromCharCode(1) + "pwsh-cwd:";
 const SPAWN_ENV = {
 	PYTHONIOENCODING: "utf-8",
 	PYTHONUTF8: "1",
@@ -79,13 +77,14 @@ export interface BgJob {
 	command: string;
 	cwd: string;
 	proc: ChildProcess;
+	stop: () => void;
 	output: string;
 	/** Absolute stream offset represented by output[0]. */
 	baseOffset: number;
 	/** Absolute stream offset already returned by pwsh_job output/wait. */
 	cursor: number;
-	/** A chunk may end between CR and LF; skip that LF on the next chunk. */
-	pendingCarriageReturn: boolean;
+	/** Shared runner status is available to explicit inspection, never automatic messages. */
+	outcome?: ExecutionOutcome;
 	truncated: boolean;
 	startedAt: number;
 	endedAt?: number;
@@ -95,7 +94,6 @@ export interface BgJob {
 	killedByTool: boolean;
 	timedOut: boolean;
 	readyNotified: boolean;
-	timer?: NodeJS.Timeout;
 	/** Callbacks invoked on every output chunk and on exit; used by `wait`. */
 	watchers: Set<() => void>;
 	/** Number of pending `wait` calls. While > 0 the exit is being observed
@@ -162,9 +160,11 @@ function samePath(left: string, right: string): boolean {
 }
 
 function statusOf(job: BgJob): string {
+	if (job.killedByTool) return "stopped";
+	if (job.outcome?.cleanupError) return "cleanup failed (process may still be running)";
+	if (job.outcome?.spawnError) return "spawn failed";
 	if (job.running) return "running";
-	if (job.timedOut) return "timeout (killed)";
-	if (job.killedByTool) return "killed";
+	if (job.timedOut) return "timeout (termination requested)";
 	return `exited ${job.exitCode}`;
 }
 
@@ -226,7 +226,7 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 	// left to pi-subagents' fleet view so both lists can coexist.)
 	const jobList = new JobList(jobs, (job) => {
 		try {
-			if (job.proc.pid) killProcessTree(job.proc.pid);
+			job.stop();
 			job.killedByTool = true;
 		} catch (error) {
 			uiCtx?.ui.notify(`Failed to kill ${job.id}: ${String(error)}`, "error");
@@ -234,6 +234,34 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 	});
 	// Foreground pwsh calls serialize here (see the foreground branch below).
 	let foregroundChain: Promise<void> = Promise.resolve();
+	const executions = new Set<Execution>();
+	const failedResults = new Map<string, ExecutionOutcome>();
+	// Pi marks thrown tool executions as errors; enrich that error result with metadata.
+	pi.on("tool_result", (event) => {
+		if (event.toolName !== "pwsh") return;
+		const details = failedResults.get(event.toolCallId);
+		failedResults.delete(event.toolCallId);
+		if (details) return { details };
+	});
+	function launch(options: Parameters<typeof startExecution>[0], toolCallId?: string): Execution {
+		let execution: Execution;
+		try { execution = startExecution(options); }
+		catch (error) {
+			if (toolCallId && error instanceof ExecutionLaunchError) failedResults.set(toolCallId, error.outcome);
+			throw error;
+		}
+		executions.add(execution);
+		void execution.done.then((result) => {
+			// Retain failed-cleanup handles so shutdown can retry rather than orphan them silently.
+			if (!result.cleanupError) executions.delete(execution);
+		});
+		return execution;
+	}
+	function enqueueForeground<T>(run: () => Promise<T>): Promise<T> {
+		const queued = foregroundChain.then(run);
+		foregroundChain = queued.then(() => undefined, () => undefined);
+		return queued;
+	}
 
 	function detectRuntime(): PowerShellRuntime | undefined {
 		try {
@@ -275,65 +303,22 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 	function createUserPowerShellOperations(detected: PowerShellRuntime): BashOperations {
 		return {
 			exec(command, cwd, options) {
-				if (currentCwd && !existsSync(currentCwd)) currentCwd = undefined;
-				const startCwd = currentCwd ?? cwd;
-				const proc = spawnPowerShell(
-					detected.executable,
-					buildPowerShellScript(command, CWD_MARKER),
-					{ cwd: startCwd, env: { ...process.env, ...SPAWN_ENV, ...options.env } },
-				);
-				return new Promise<{ exitCode: number | null }>((resolve, reject) => {
-					let settled = false;
-					let timer: NodeJS.Timeout | undefined;
-					let cleanupError: unknown;
-					let output = "";
-					const stdoutDecoder = new StringDecoder("utf8");
-					const stderrDecoder = new StringDecoder("utf8");
-					const stop = () => {
-						if (!proc.pid) return;
-						try {
-							killProcessTree(proc.pid);
-						} catch (error) {
-							cleanupError = error;
-						}
-					};
-					const onAbort = () => stop();
-					if (options.timeout && options.timeout > 0) {
-						timer = setTimeout(stop, options.timeout);
-						timer.unref?.();
-					}
-					options.signal?.addEventListener("abort", onAbort, { once: true });
-					proc.stdout?.on("data", (chunk: Buffer) => { output += stdoutDecoder.write(chunk); });
-					proc.stderr?.on("data", (chunk: Buffer) => { output += stderrDecoder.write(chunk); });
-					proc.stdout?.on("end", () => { output += stdoutDecoder.end(); });
-					proc.stderr?.on("end", () => { output += stderrDecoder.end(); });
-					const cleanup = () => {
-						if (timer) clearTimeout(timer);
-						options.signal?.removeEventListener("abort", onAbort);
-					};
-					proc.on("error", (error) => {
-						if (settled) return;
-						settled = true;
-						cleanup();
-						reject(error);
+				timeoutMilliseconds(options.timeout);
+				return enqueueForeground(async () => {
+					if (shutdown) throw new Error("session is shutting down");
+					if (currentCwd && !existsSync(currentCwd)) currentCwd = undefined;
+					const execution = launch({
+						executable: detected.executable, command, cwd: currentCwd ?? cwd,
+						env: { ...process.env, ...SPAWN_ENV, ...options.env },
+						timeout: options.timeout, signal: options.signal, captureCwd: true,
+						onData: (text) => options.onData(Buffer.from(text, "utf8")),
 					});
-					proc.on("close", (exitCode) => {
-						if (settled) return;
-						settled = true;
-						cleanup();
-						const markerIndex = output.lastIndexOf(CWD_MARKER);
-						if (markerIndex >= 0) {
-							const lineEnd = output.indexOf("\n", markerIndex);
-							const dir = output
-								.slice(markerIndex + CWD_MARKER.length, lineEnd === -1 ? undefined : lineEnd)
-								.trim();
-							output = output.slice(0, markerIndex) + (lineEnd === -1 ? "" : output.slice(lineEnd + 1));
-							if (dir) currentCwd = resolvePath(dir);
-						}
-						if (output) options.onData(Buffer.from(output.replace(/\r\n?/g, "\n"), "utf8"));
-						if (cleanupError) reject(cleanupError);
-						else resolve({ exitCode });
-					});
+					const result = await execution.done;
+					if (result.cwd) currentCwd = resolvePath(result.cwd);
+					if (result.spawnError || result.cleanupError) throw new Error(executionNotes(result).join("; "));
+					const notes = executionNotes(result);
+					if (notes.length) options.onData(Buffer.from(`\n[${notes.join("; ")}]\n`, "utf8"));
+					return { exitCode: executionFailed(result) ? (result.exitCode || 1) : 0 };
 				});
 			},
 		};
@@ -490,12 +475,9 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 	// Windows grants a few seconds of grace after console close, enough to
 	// kill the process trees explicitly.
 	const reap = () => {
-		for (const job of jobs.values()) {
-			if (job.running && job.proc.pid) {
-				try {
-					killProcessTree(job.proc.pid);
-				} catch {}
-			}
+		for (const execution of executions) {
+			try { execution.stop(); }
+			catch (error) { uiCtx?.ui.notify(`Process-tree cleanup failed: ${String(error)}`, "error"); }
 		}
 	};
 	// Signal handlers are the fallback for hard terminal closes (SIGHUP on
@@ -521,25 +503,14 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 		process.off("exit", reap);
 		for (const sig of SIGNALS) process.off(sig, onSignal);
 		jobList.dispose();
-		const runningJobs = [...jobs.values()].filter((job) => job.running || job.settling);
-		await Promise.all(
-			runningJobs.map(
-				(job) =>
-					new Promise<void>((resolve) => {
-						let done = false;
-						const finish = () => {
-							if (done) return;
-							done = true;
-							clearTimeout(timer);
-							job.watchers.delete(finish);
-							resolve();
-						};
-						const timer = setTimeout(finish, 2_000);
-						job.watchers.add(finish);
-						if (!job.running && !job.settling) finish();
-					}),
-			),
-		);
+		let timer: NodeJS.Timeout | undefined;
+		try {
+			await Promise.race([
+				Promise.all([...executions].map((execution) => execution.done)),
+				new Promise<void>((resolve) => { timer = setTimeout(resolve, 2_000); }),
+			]);
+		} finally { if (timer) clearTimeout(timer); }
+		failedResults.clear();
 		uiCtx = undefined;
 	});
 
@@ -592,7 +563,7 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 			),
 			timeout: Type.Optional(
 				Type.Number({
-					description: `Process-tree timeout in seconds; default ${FG_DEFAULT_TIMEOUT_SEC} foreground, unlimited background`,
+					description: `Timeout seconds; 0 unlimited; max 2147483.647; default ${FG_DEFAULT_TIMEOUT_SEC} foreground, unlimited background`,
 				}),
 			),
 			name: Type.Optional(Type.String({ description: "Optional background-job label" })),
@@ -602,6 +573,9 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 		}),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			uiCtx = ctx;
+			timeoutMilliseconds(params.timeout, params.run_in_background ? 0 : FG_DEFAULT_TIMEOUT_SEC);
+			if (params.run_in_background && signal?.aborted) throw new Error("command aborted before launch");
+			if (shutdown) throw new Error("session is shutting down");
 			const detected = requireRuntime();
 			rejectTrailingAmpersand(params.command);
 
@@ -618,20 +592,31 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 					}
 				}
 				const id = `bg-${++jobCounter}`;
-				const proc = spawnPowerShell(detected.executable, buildPowerShellScript(params.command), {
-					cwd,
-					env: buildToolEnv(ctx),
+				const execution = launch({
+					executable: detected.executable, command: params.command, cwd,
+					env: buildToolEnv(ctx), timeout: params.timeout, signal: undefined,
+					onData: () => {
+						job.output = execution.output.text;
+						job.baseOffset = execution.output.droppedChars;
+						job.truncated = job.baseOffset > 0;
+						if (readyRegex && !job.readyNotified && readyRegex.test(job.output)) {
+							job.readyNotified = true;
+							notifyReady(job);
+						}
+						for (const watcher of [...job.watchers]) watcher();
+					},
 				});
+				const proc = execution.proc;
 				const job: BgJob = {
 					id,
 					name: params.name,
 					command: params.command,
 					cwd,
 					proc,
+					stop: execution.stop,
 					output: "",
 					baseOffset: 0,
 					cursor: 0,
-					pendingCarriageReturn: false,
 					truncated: false,
 					startedAt: Date.now(),
 					exitCode: null,
@@ -645,85 +630,23 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 					terminalObserved: false,
 					mutex: Promise.resolve(),
 				};
-				const appendText = (decoded: string) => {
-					let text = decoded;
-					if (job.pendingCarriageReturn) {
-						if (text.startsWith("\n")) text = text.slice(1);
-						job.pendingCarriageReturn = false;
-					}
-					job.pendingCarriageReturn = text.endsWith("\r");
-					text = text.replace(/\r\n?/g, "\n");
-					if (!text) return;
-					job.output += text;
-					if (job.output.length > BG_MAX_BUFFER_CHARS) {
-						const dropped = job.output.length - BG_MAX_BUFFER_CHARS;
-						job.output = job.output.slice(dropped);
-						job.baseOffset += dropped;
-						job.truncated = true;
-					}
-					if (readyRegex && !job.readyNotified) {
-						const m = readyRegex.exec(job.output);
-						if (m) {
-							job.readyNotified = true;
-							notifyReady(job);
-						}
-					}
-					for (const w of [...job.watchers]) w();
-				};
-				const captureStream = (stream: typeof proc.stdout, decoder: StringDecoder) =>
-					new Promise<void>((resolve) => {
-						if (!stream) return resolve();
-						let settled = false;
-						stream.on("data", (chunk: Buffer) => appendText(decoder.write(chunk)));
-						const finish = () => {
-							if (settled) return;
-							settled = true;
-							appendText(decoder.end());
-							resolve();
-						};
-						stream.once("end", finish);
-						stream.once("close", finish);
-					});
-				const outputSettled = Promise.all([
-					captureStream(proc.stdout, new StringDecoder("utf8")),
-					captureStream(proc.stderr, new StringDecoder("utf8")),
-				]);
-				if (params.timeout && params.timeout > 0) {
-					job.timer = setTimeout(() => {
-						if (job.running && proc.pid) {
-							job.timedOut = true;
-							try {
-								killProcessTree(proc.pid);
-							} catch (error) {
-								appendText(`\n[kill error] ${String(error)}\n`);
-								uiCtx?.ui.notify(`Failed to stop timed-out ${job.id}: ${String(error)}`, "error");
-							}
-						}
-					}, params.timeout * 1000);
-					job.timer.unref?.();
-				}
-				const onExit = async (annotate?: () => void) => {
-					if (!job.running || job.settling) return;
-					job.settling = true;
-					annotate?.();
-					if (job.timer) clearTimeout(job.timer);
-					await outputSettled;
+				void execution.done.then((result) => {
+					const notes = executionNotes(result);
+					if (notes.length) execution.output.append(`\n[${notes.join("; ")}]\n`);
+					job.output = execution.output.text;
+					job.baseOffset = execution.output.droppedChars;
+					job.truncated = job.baseOffset > 0;
+					job.outcome = result;
+					job.exitCode = result.exitCode;
+					job.timedOut = result.timedOut;
 					job.endedAt = Date.now();
 					job.running = false;
 					job.settling = false;
 					const observed = job.waiters > 0 || job.terminalObserved;
-					for (const w of [...job.watchers]) w();
+					for (const watcher of [...job.watchers]) watcher();
 					if (shutdown) return;
 					if (!job.killedByTool && !observed) notifyFinished(job);
 					updateRunningStatus();
-				};
-				proc.on("error", (err) => {
-					void onExit(() => appendText(`\n[spawn error] ${err.message}\n`));
-				});
-				proc.on("close", (code) => {
-					void onExit(() => {
-						job.exitCode = code;
-					});
 				});
 				jobs.set(id, job);
 				updateRunningStatus();
@@ -737,103 +660,30 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 			// ---------- foreground ----------
 			// Resolve cwd only after this call reaches the queue so a preceding
 			// concurrent directory change is visible to the next command.
-			const timeoutSec = params.timeout ?? FG_DEFAULT_TIMEOUT_SEC;
-			const exec = () => {
-				if (signal?.aborted) return Promise.reject(new Error("command aborted"));
+			return enqueueForeground(async () => {
+				if (shutdown) throw new Error("session is shutting down");
 				if (currentCwd && !existsSync(currentCwd)) currentCwd = undefined;
 				const cwd = currentCwd ?? ctx.cwd;
-				return new Promise<ReturnType<typeof textResult>>((resolve, reject) => {
-					const proc = spawnPowerShell(
-						detected.executable,
-						buildPowerShellScript(params.command, CWD_MARKER),
-						{ cwd, env: buildToolEnv(ctx) },
-					);
-					let out = "";
-					let pendingCarriageReturn = false;
-					let timedOut = false;
-					let aborted = false;
-					let killError: string | undefined;
-					const stop = () => {
-						if (!proc.pid) return;
-						try {
-							killProcessTree(proc.pid);
-						} catch (error) {
-							killError = String(error);
-						}
-					};
-					const timer =
-						timeoutSec > 0
-							? setTimeout(() => {
-									timedOut = true;
-									stop();
-								}, timeoutSec * 1000)
-							: undefined;
-					timer?.unref?.();
-					const onAbort = () => {
-						aborted = true;
-						stop();
-					};
-					signal?.addEventListener("abort", onAbort, { once: true });
-					const appendText = (decoded: string) => {
-						let text = decoded;
-						if (pendingCarriageReturn) {
-							if (text.startsWith("\n")) text = text.slice(1);
-							pendingCarriageReturn = false;
-						}
-						pendingCarriageReturn = text.endsWith("\r");
-						text = text.replace(/\r\n?/g, "\n");
-						if (!text) return;
-						out += text;
-						onUpdate?.(textResult(tailChars(out, FG_LIVE_PREVIEW_CHARS)));
-					};
-					const stdoutDecoder = new StringDecoder("utf8");
-					const stderrDecoder = new StringDecoder("utf8");
-					proc.stdout?.on("data", (chunk: Buffer) => appendText(stdoutDecoder.write(chunk)));
-					proc.stderr?.on("data", (chunk: Buffer) => appendText(stderrDecoder.write(chunk)));
-					proc.stdout?.on("end", () => appendText(stdoutDecoder.end()));
-					proc.stderr?.on("end", () => appendText(stderrDecoder.end()));
-					const cleanup = () => {
-						if (timer) clearTimeout(timer);
-						signal?.removeEventListener("abort", onAbort);
-					};
-					proc.on("error", (err) => {
-						cleanup();
-						reject(err);
-					});
-					proc.on("close", (code) => {
-						cleanup();
-						const notes: string[] = [];
-						let text = out;
-						const markerIndex = text.lastIndexOf(CWD_MARKER);
-						if (markerIndex >= 0) {
-							const lineEnd = text.indexOf("\n", markerIndex);
-							const dir = text
-								.slice(markerIndex + CWD_MARKER.length, lineEnd === -1 ? undefined : lineEnd)
-								.trim();
-							text = text.slice(0, markerIndex) + (lineEnd === -1 ? "" : text.slice(lineEnd + 1));
-							if (dir && !samePath(dir, cwd)) notes.push(`cwd is now ${dir}`);
-							if (dir) currentCwd = resolvePath(dir);
-						}
-						text = text.trim();
-						if (timedOut)
-							notes.push(
-								`command timed out after ${timeoutSec}s and was killed. If this is a dev server or watcher, rerun with run_in_background: true`,
-							);
-						else if (aborted) notes.push("command aborted");
-						else if (code !== 0) notes.push(`exit code: ${code}`);
-						if (killError) notes.push(`process-tree cleanup error: ${killError}`);
-						if (notes.length > 0) text = text ? `${text}\n\n${notes.join("; ")}` : notes.join("; ");
-						resolve(textResult(boundedTail(text || "(no output)")));
-					});
-				});
-			};
-			return await new Promise<ReturnType<typeof textResult>>((resolve, reject) => {
-				const queued = foregroundChain.then(exec);
-				foregroundChain = queued.then(
-					() => undefined,
-					() => undefined,
-				);
-				queued.then(resolve, reject);
+				const updates = outputUpdates(() => onUpdate?.(textResult(tailChars(execution.output.text, FG_LIVE_PREVIEW_CHARS))));
+				const execution = launch({
+					executable: detected.executable, command: params.command, cwd, env: buildToolEnv(ctx),
+					timeout: params.timeout ?? FG_DEFAULT_TIMEOUT_SEC, signal, captureCwd: true,
+					onData: onUpdate ? () => updates.mark() : undefined,
+				}, _toolCallId);
+				let result: ExecutionOutcome;
+				try { result = await execution.done; }
+				finally { updates.finish(); }
+				const notes = executionNotes(result);
+				if (result.cwd) {
+					if (!samePath(result.cwd, cwd)) notes.push(`cwd is now ${result.cwd}`);
+					currentCwd = resolvePath(result.cwd);
+				}
+				const text = boundedTail([execution.output.text.trim(), ...notes].filter(Boolean).join("\n\n") || "(no output)");
+				if (executionFailed(result)) {
+					failedResults.set(_toolCallId, result);
+					throw new Error(text);
+				}
+				return { ...textResult(text), details: result };
 			});
 		},
 	});
@@ -864,11 +714,13 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 				Type.String({ description: "Wait regex matched against unseen output; omit to wait for exit" }),
 			),
 			timeout: Type.Optional(
-				Type.Number({ description: `Wait timeout in seconds; default ${WAIT_DEFAULT_TIMEOUT_SEC}, job remains running` }),
+				Type.Number({ description: `Wait seconds; 0 unlimited; max 2147483.647; default ${WAIT_DEFAULT_TIMEOUT_SEC}; job keeps running` }),
 			),
 		}),
 		executionMode: "parallel",
 		async execute(_toolCallId, params, signal) {
+			const waitTimeoutMs = timeoutMilliseconds(params.timeout, WAIT_DEFAULT_TIMEOUT_SEC);
+			if (signal?.aborted) throw new Error("job operation aborted");
 			if (params.action === "list") {
 				if (jobs.size === 0) return textResult("No background jobs this session.");
 				const rows = [...jobs.values()].map((j) => {
@@ -885,13 +737,13 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 			}
 			if (params.action === "kill") {
 				notifications.cancel(job.id);
-				if (!job.running) {
+				if (!job.running && !job.outcome?.cleanupError) {
 					job.terminalObserved = true;
 					return textResult(`${job.id} already finished (${statusOf(job)}).`);
 				}
-				if (job.proc.pid) killProcessTree(job.proc.pid);
+				job.stop();
 				job.killedByTool = true;
-				return textResult(`Killed ${job.id} (PID ${job.proc.pid}).`);
+				return textResult(`Stopped ${job.id} (PID ${job.proc.pid}); independently detached descendants may remain.`);
 			}
 			if (params.action === "wait") {
 				let regex: RegExp | undefined;
@@ -933,11 +785,12 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 					const onAbort = () => finish("aborted");
 					job.watchers.add(check);
 					job.waiters++;
-					if (timeoutSec > 0) {
-						timer = setTimeout(() => finish("timeout"), timeoutSec * 1000);
+					if (waitTimeoutMs !== undefined) {
+						timer = setTimeout(() => finish("timeout"), waitTimeoutMs);
 						timer.unref?.();
 					}
 					signal?.addEventListener("abort", onAbort, { once: true });
+					if (signal?.aborted) onAbort();
 					check(); // the condition may already hold (buffered match / already exited)
 				});
 				observeJobState(job, outcome === "matched");
@@ -953,7 +806,7 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 								: `${job.id} — wait aborted, job still ${statusOf(job)}`;
 				const body = tailLines(fresh.text, WAIT_TAIL_LINES).trim() || "(no output)";
 				const warning = fresh.missed ? "[warning: unseen output rolled out of the in-memory buffer]\n" : "";
-				return textResult(boundedResult(`${head}\n${warning}--- output since last check ---`, body, WAIT_TAIL_LINES));
+				return { ...textResult(boundedResult(`${head}\n${warning}--- output since last check ---`, body, WAIT_TAIL_LINES)), details: job.outcome };
 			}
 			// action === "output": incremental since the previous check
 			observeJobState(job, true);
@@ -966,9 +819,10 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 				job.truncated ? " (buffer truncated, oldest output dropped)" : ""
 			}${requestedLines === 0 ? "" : fresh.text ? ", new output since last check:" : ""}`;
 			const warning = fresh.missed ? "[warning: unseen output rolled out of the in-memory buffer]" : "";
-			return textResult(
-				boundedResult([head, warning].filter(Boolean).join("\n"), body, requestedLines === 0 ? DEFAULT_MAX_LINES : requestedLines),
-			);
+			return {
+				...textResult(boundedResult([head, warning].filter(Boolean).join("\n"), body, requestedLines === 0 ? DEFAULT_MAX_LINES : requestedLines)),
+				details: job.outcome,
+			};
 		},
 	});
 }

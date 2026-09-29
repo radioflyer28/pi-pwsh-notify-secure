@@ -4,7 +4,7 @@ Comparison baseline: upstream tag `v0.5.0` (`4a7a48a`)
 Secure baseline: `v0.4.2-secure.2` (`8bf943f`)
 Target release: `0.5.0-secure.1`
 
-This release is a semantic adaptation, not a merge or cherry-pick. The matrix accounts for upstream 0.5.0 behavior against the private fork's security requirements.
+This release is a semantic adaptation, not a merge or cherry-pick. The matrix accounts for upstream 0.5.0 behavior against the fork's security requirements.
 
 ## Adopted behavior
 

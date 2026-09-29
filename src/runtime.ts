@@ -85,6 +85,7 @@ export function killProcessTree(pid: number, env: NodeJS.ProcessEnv = process.en
 	const result = spawnSync(executable, ["/PID", String(pid), "/T", "/F"], {
 		encoding: "utf8",
 		windowsHide: true,
+		timeout: 2_000,
 	});
 	if (result.status !== 0 && isProcessRunning(pid)) {
 		const detail = (result.stderr || result.stdout || result.error?.message || `status ${result.status}`).trim();

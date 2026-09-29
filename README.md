@@ -1,13 +1,13 @@
 # pi-pwsh-notify-secure
 
-Security-hardened private fork of [oversk7/pi-pwsh-notify](https://github.com/oversk7/pi-pwsh-notify). Release `0.5.0-secure.4` selectively adapts upstream 0.5.0 reliability work without adopting its weaker executable resolution, execution-policy override, automatic output disclosure, or default complete-output logs.
+Security-hardened fork of [oversk7/pi-pwsh-notify](https://github.com/oversk7/pi-pwsh-notify). Release `0.5.0-secure.5` selectively adapts upstream 0.5.0 reliability work without adopting its weaker executable resolution, execution-policy override, automatic output disclosure, or default complete-output logs.
 
 English | [中文说明](#中文说明)
 
 Trusted PowerShell shell for [pi](https://pi.dev) on Windows (PowerShell 7 preferred, Windows PowerShell fallback), with **Claude Code-style background jobs that auto-notify the agent on completion** — no polling.
 
 ```
-pi install git:github.com/radioflyer28/pi-pwsh-notify-secure@v0.5.0-secure.4
+pi install git:github.com/radioflyer28/pi-pwsh-notify-secure@v0.5.0-secure.5
 ```
 
 ## Why
@@ -60,14 +60,15 @@ Expansion uses Pi's configurable `app.tools.expand` action (`Ctrl-O` by default)
 - **`cd` persists between calls** (tracked by the extension); variables and functions do not — each call is a fresh `pwsh -NoProfile -NonInteractive` process
 - Commands are transported as BOM-less UTF-8 over stdin through a fixed bootstrap, avoiding Windows command-line length and quoting limits
 - Per-stream UTF-8 decoders preserve multibyte characters split across process chunks; CRLF and bare carriage returns are normalized before TUI/model output
-- Default 120s timeout (overridable per call); the whole process **tree** is killed on timeout, with a hint to rerun with `run_in_background` if it looks like a server
+- Default 120s timeout (overridable per call); timeout or cancellation requests whole-process-tree termination, and cleanup failures are reported rather than claimed as successful kills
 - A trailing `&` is rejected with a pointer to `run_in_background` — a PowerShell job would die silently with the wrapper process
-- Final native exit codes and PowerShell cmdlet failures are reported correctly, while a later successful operation clears stale failure state
-- Foreground results use Pi's standard byte/line limits; live output streams while the command runs
+- Nonzero exits, timeouts, cancellation, spawn failures, and cleanup failures produce **failed tool results**, with retained output and structured execution details; a later successful command is not marked as a stale failure
+- Foreground capture keeps at most 400,000 UTF-16 code units (not a complete transcript); final results additionally use Pi's standard byte/line limits. Cwd control records are parsed separately, so retention rollover cannot discard a directory change
+- Live foreground previews are coalesced to one update per 100ms, with a final dirty update flushed at completion
 
 ### Background (`run_in_background: true`)
 
-- Returns immediately with a job id; output stays in a bounded in-memory tail (last 400 KB) with absolute cursors and explicit warnings if unseen data rolls out
+- Returns immediately with a job id; output stays in a bounded in-memory tail (last 400,000 UTF-16 code units) with absolute cursors and explicit warnings if unseen data rolls out
 - On exit, a metadata-only `<background-job-finished>` notification (job id, status, runtime) is injected into the session; command and output text are intentionally omitted
 - **`notify_on` regex** — for processes that never exit (dev servers, watchers): the first output match injects a one-time metadata-only `<background-job-ready>` notification, so "server is up" also arrives without polling (e.g. `notify_on: "Local:.*http"` for vite)
 - Rendered in the TUI as a single status row — `● bg job bg-1 (pytest) · exited 0 · 7s`; inspect output explicitly through `pwsh_job` or the job viewer
@@ -78,6 +79,16 @@ Expansion uses Pi's configurable `app.tools.expand` action (`Ctrl-O` by default)
 - **Job viewer (Claude Code style)** — while jobs run, a live list sits below the input box: press `→` (or `Tab`) at an empty prompt to focus it, `↑`/`↓` to select a job, `Enter` to open its **live output overlay** (scrollable, auto-follows new output, `PgUp`/`PgDn`/`Home`/`End`), and press `x` twice to **kill the job** from the overlay. (`↓`/`←` are intentionally left to pi-subagents' fleet view, so both lists can be shown and entered at once)
 - Jobs belong to the session: they are reaped when it ends — pi exiting (including **closing the terminal window**: SIGHUP/SIGBREAK/SIGTERM are handled, not just graceful exit), `/reload`, or switching sessions (`/new`, `/resume`, `/fork`) — and shutdown waits only for a bounded settlement interval
 - Complete command output is **not written to temporary or persistent log files by default**; output is available only through explicit bounded tool results, the live viewer, and the in-memory tail
+
+### Shared execution and timeout semantics
+
+Foreground, background, and `!`/`!!` execution share the same process lifecycle, independent stdout/stderr decoders, bounded output retention, and cancellation handling. `!`/`!!` output streams immediately to Pi; user-shell calls share the foreground cwd queue.
+
+All timeouts are **seconds**, including the `BashOperations` adapter. Omitted timeouts mean 120 seconds for foreground `pwsh` and `pwsh_job wait`, unlimited for background and user-shell operations. Explicit `0` means unlimited. Negative, nonfinite, and values above `2147483.647` seconds are rejected before launch/wait; positive sub-millisecond values round up to 1ms. A wait timeout does not stop the job.
+
+When a shell exits but a descendant holds stdout/stderr open, capture settles after **250ms of pipe inactivity**, restarting that grace period on every output chunk. Normal EOF finishes immediately. Explicit results warn if capture ended with open pipes; late output after that boundary may be lost. A managed job represents the original shell, not every independently detached descendant. Keep servers in the foreground of the managed shell rather than daemonizing them. Continuous post-exit output keeps capture active, but an explicit execution timeout or cancellation still stops capture. After the parent exits, stopping capture cannot guarantee termination of independently detached descendants; it does not target the now-stale parent PID.
+
+The shared runner never writes output logs. **Pi itself owns the `!`/`!!` output consumer** and Pi 0.87.1 may spill large user-shell output to temporary `pi-bash-*.log` files. Use `pwsh`/`pwsh_job` when the extension's no-complete-output-log behavior is required. Normal Pi conversation persistence still applies to returned tool output.
 
 ## Built-in tool handling
 
@@ -110,7 +121,7 @@ Expansion uses Pi's configurable `app.tools.expand` action (`Ctrl-O` by default)
 - PowerShell and `taskkill.exe` are launched only by verified absolute path. Empty and relative `PATH` entries are ignored, and no `where.exe` subprocess is used, preventing current-directory executable hijacking in untrusted repositories.
 - Automatic ready/finished steering messages contain metadata only. Commands, matched lines, stdout/stderr, and log paths are omitted; output must be retrieved explicitly and is identified to the agent as untrusted data.
 - Shells run with `-NoProfile -NonInteractive`; this fork does not force `-ExecutionPolicy Bypass`.
-- No full-output temporary logs are created by default.
+- `pwsh`/`pwsh_job` and the shared runner create no full-output temporary logs. Pi's own `!`/`!!` consumer has separate retention behavior, described above.
 
 ## Notes
 
@@ -124,7 +135,7 @@ Expansion uses Pi's configurable `app.tools.expand` action (`Ctrl-O` by default)
 Windows 下给 [pi](https://pi.dev) 用的 PowerShell 7 shell，带 Claude Code 风格的后台任务：**任务结束后自动通知 agent，无需轮询**。
 
 ```
-pi install git:github.com/radioflyer28/pi-pwsh-notify-secure@v0.5.0-secure.4
+pi install git:github.com/radioflyer28/pi-pwsh-notify-secure@v0.5.0-secure.5
 ```
 
 ### 它解决的问题

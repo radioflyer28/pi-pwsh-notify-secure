@@ -5,7 +5,7 @@ Release examined: Pi `v0.84.3`, commit [`4e58f324fae8ebfa98a3d45181fb248072a2afa
 
 ## Compatibility addendum for the secure 0.5.0 adaptation
 
-`pi-pwsh-notify-secure` 0.5.0-secure.4 is developed and integration-tested with Pi/TUI 0.87.1. Its imported public APIs also type-check against Pi/TUI 0.84.3, so the declared peer floor remains `>=0.84.3`. This addendum records package compatibility only; the native implementation analysis and source links below intentionally remain pinned to the audited 0.84.3 release rather than claiming that every native detail is unchanged in 0.87.1.
+`pi-pwsh-notify-secure` 0.5.0-secure.5 is developed and integration-tested with Pi/TUI 0.87.1. Its imported public APIs also type-check against Pi/TUI 0.84.3, so the declared peer floor remains `>=0.84.3`. This addendum records package compatibility only; the native implementation analysis and source links below intentionally remain pinned to the audited 0.84.3 release rather than claiming that every native detail is unchanged in 0.87.1.
 
 The secure adaptation selectively ports upstream `pi-pwsh-notify` 0.5.0 reliability work: fixed-bootstrap stdin transport, status capture, streaming UTF-8 decoders, rollover-safe absolute cursors, bounded Pi-standard results, retryable/cancellable notification batches, runtime-aware tool selection, `!`/`!!` routing, and bounded shutdown settlement. It intentionally retains absolute executable and `taskkill.exe` resolution, omits `-ExecutionPolicy Bypass`, keeps automatic messages metadata-only, removes both built-in shell tools only while the secure runtime is active, and creates no default complete-output logs.
 
