@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { readdir } from "node:fs/promises";
+import { realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -10,6 +11,15 @@ import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, wrapRegisteredTool } from "@earen
 process.setMaxListeners(100);
 
 const REPO = fileURLToPath(new URL("..", import.meta.url));
+
+/** PowerShell expands Windows 8.3 aliases; compare directory identity, not spelling. */
+function assertSameDirectory(actual: string, expected: string): void {
+  const canonical = (path: string) => {
+    const resolved = realpathSync.native(path.trim());
+    return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+  };
+  assert.equal(canonical(actual), canonical(expected));
+}
 const require = createRequire(import.meta.url);
 const jiti = require("jiti")(import.meta.url, { interopDefault: true });
 const extensionModule = jiti(fileURLToPath(new URL("../src/index.ts", import.meta.url)));
@@ -172,6 +182,29 @@ async function runRuntime(command: string): Promise<{ output: string; code: numb
 }
 
 // Real-process coverage is explicitly Windows-only.
+test("cwd assertions compare canonical paths across Windows short-name aliases", { skip: process.platform !== "win32" }, async (t) => {
+  const harness = makeHarness();
+  harness.fire("session_start");
+  try {
+    const dir = process.env.ProgramFiles;
+    assert.ok(dir, "ProgramFiles must identify an existing directory");
+    const escaped = dir.replaceAll("'", "''");
+    const result = await harness.call("pwsh", {
+      command: `$folder = (New-Object -ComObject Scripting.FileSystemObject).GetFolder('${escaped}'); Write-Output $folder.ShortPath`,
+    });
+    const shortPath = textOf(result).trim();
+    assertSameDirectory(shortPath, dir);
+    assert.throws(() => assertSameDirectory(shortPath, REPO), assert.AssertionError);
+    if (shortPath.toLowerCase() === dir.toLowerCase()) {
+      t.skip("8.3 aliases are disabled for ProgramFiles on this machine");
+      return;
+    }
+    assert.notEqual(shortPath.toLowerCase(), dir.toLowerCase());
+  } finally {
+    harness.fire("session_shutdown");
+  }
+});
+
 test("user shell: secure operations execute and persist cwd", { skip: process.platform !== "win32" }, async () => {
   const harness = makeHarness();
   harness.fire("session_start");
@@ -192,7 +225,7 @@ test("user shell: secure operations execute and persist cwd", { skip: process.pl
     onData: (chunk: Buffer) => { secondOutput += chunk.toString("utf8"); },
     timeout: 5,
   });
-  assert.match(secondOutput, new RegExp(dir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"));
+  assertSameDirectory(secondOutput, dir);
   harness.fire("session_shutdown");
 });
 
@@ -304,7 +337,7 @@ test("windows runtime: foreground cwd persists and concurrent calls serialize", 
     harness.call("pwsh", { command: "$PWD.Path" }),
   ]);
   assert.match(textOf(first), /moved/);
-  assert.match(textOf(second), new RegExp(dir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"));
+  assertSameDirectory(textOf(second), dir);
   harness.fire("session_shutdown");
 });
 
@@ -627,7 +660,7 @@ test("execution stress: 32 MiB foreground output stays bounded, coalesces update
   assert.match(updates.at(-1)!.text, /FINAL_STRESS_TAIL/);
   assert.ok(updates.every((update) => !update.text.includes("pwsh-cwd:")));
   const next = await harness.call("pwsh", { command: "$PWD.Path" });
-  assert.match(textOf(next), new RegExp(dir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"));
+  assertSameDirectory(textOf(next), dir);
   const count = updates.length;
   await sleep(150);
   assert.equal(updates.length, count);
@@ -663,7 +696,7 @@ test("user shell streams before completion, strips cwd records, and shares the f
   const user = operations.exec(`Set-Location '${dir.replaceAll("'", "''")}'; Start-Sleep -Milliseconds 200`, REPO, { onData() {} });
   const tool = harness.call("pwsh", { command: "$PWD.Path" });
   await user;
-  assert.match(textOf(await tool), new RegExp(dir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"));
+  assertSameDirectory(textOf(await tool), dir);
   await harness.emit("session_shutdown");
 });
 
