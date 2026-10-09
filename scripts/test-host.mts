@@ -7,10 +7,10 @@ import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 
 // Isolate host versions; never mutate repo node_modules, lockfile, installed Pi, or npm age policy.
-const versions = ["0.84.3", "0.87.1", "0.99.1"];
+const versions = ["0.84.3", "0.87.1", "0.99.1", "1.1.0"];
 const args = process.argv.slice(2);
 const option = (name: string) => args[args.indexOf(name) + 1];
-const version = args.includes("--version") ? option("--version") : "0.99.1";
+const version = args.includes("--version") ? option("--version") : "1.1.0";
 if (!versions.includes(version)) throw new Error(`Expected --version ${versions.join(" | ")}`);
 const repo = fileURLToPath(new URL("..", import.meta.url));
 const sandbox = await mkdtemp(join(tmpdir(), `pwsh-host-${version}-`));
@@ -25,7 +25,8 @@ let host: string;
 let tui: string;
 if (args.includes("--installed")) {
 	host = resolve(option("--installed"));
-	tui = join(host, "node_modules/@earendil-works/pi-tui");
+	const bundledTui = join(host, "node_modules/@earendil-works/pi-tui");
+	tui = existsSync(bundledTui) ? bundledTui : join(dirname(host), "pi-tui");
 } else {
 	await writeFile(join(fixture, "package.json"), JSON.stringify({ private: true, dependencies: {
 		"@earendil-works/pi-coding-agent": version, "@earendil-works/pi-tui": version,

@@ -12,15 +12,23 @@ test("the hardened git package cannot be published to npm accidentally", () => {
 	assert.equal(packageJson.publishConfig, undefined);
 });
 
-test("Pi peer floor, Pi 0.87.1 development versions, and TypeBox import are consistent", () => {
+test("Pi peer floor, Pi 1.1.0 development versions, and TypeBox import are consistent", () => {
 	assert.equal(packageJson.peerDependencies["@earendil-works/pi-coding-agent"], ">=0.84.3");
 	assert.equal(packageJson.peerDependencies["@earendil-works/pi-tui"], ">=0.84.3");
-	assert.equal(packageJson.devDependencies["@earendil-works/pi-coding-agent"], "0.87.1");
-	assert.equal(packageJson.devDependencies["@earendil-works/pi-tui"], "0.87.1");
+	assert.equal(packageJson.devDependencies["@earendil-works/pi-coding-agent"], "1.1.0");
+	assert.equal(packageJson.devDependencies["@earendil-works/pi-tui"], "1.1.0");
 	assert.equal(packageJson.peerDependencies.typebox, "^1.3.7");
 	assert.equal(packageJson.peerDependencies["@sinclair/typebox"], undefined);
 	assert.match(indexSource, /from "typebox"/);
 	assert.doesNotMatch(indexSource, /@sinclair\/typebox/);
+});
+
+test("documentation distinguishes Pi 1.1.0 compatibility from the locked development baseline", () => {
+	assert.match(readme, /0\.84\.3 \/ 0\.87\.1 \/ 0\.99\.1 \/ 1\.1\.0/);
+	assert.match(readme, /default `1\.1\.0`/);
+	assert.match(readme, /seven-day npm release-age policy/);
+	assert.match(readme, /persisted `durationMs`/);
+	assert.match(readme, /fullscreen.*regular/);
 });
 
 test("release metadata and installation instructions use 0.5.0-secure.6", () => {
@@ -33,7 +41,7 @@ test("documentation records the secure upstream adaptation and compatibility beh
 	assert.match(readme, /metadata only/);
 	assert.match(readme, /not written to temporary or persistent log files by default/);
 	assert.match(readme, /`!` and `!!` editor shortcuts execute through the same trusted PowerShell runtime/);
-	assert.match(readme, /Pi\/TUI 0\.87\.1/);
+	assert.match(readme, /Pi\/TUI 1\.1\.0/);
 	assert.match(research, /selectively ports upstream `pi-pwsh-notify` 0\.5\.0 reliability work/);
 	assert.match(research, /creates no default complete-output logs/);
 });

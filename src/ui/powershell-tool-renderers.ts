@@ -52,6 +52,10 @@ export interface PowerShellRenderContext<TArgs = unknown> {
 	expanded: boolean;
 	showImages: boolean;
 	isError: boolean;
+	/** Pi 1.1+ persists final execution time; older hosts omit it. */
+	durationMs?: number;
+	/** Host-owned shell padding; this renderer must not apply it again. */
+	outputPad?: number;
 }
 
 function asString(value: unknown): string | undefined {
@@ -134,6 +138,7 @@ class PowerShellResultComponent implements Component {
 	private isError = false;
 	private startedAt?: number;
 	private endedAt?: number;
+	private durationMs?: number;
 	private cachedWidth?: number;
 	private cachedTimeSecond?: number;
 	private cachedLines?: string[];
@@ -152,7 +157,8 @@ class PowerShellResultComponent implements Component {
 			theme !== this.theme ||
 			context.isError !== this.isError ||
 			context.state.startedAt !== this.startedAt ||
-			context.state.endedAt !== this.endedAt;
+			context.state.endedAt !== this.endedAt ||
+			context.durationMs !== this.durationMs;
 		this.result = result;
 		if (resultChanged) this.output = textOutput(result).trim();
 		this.options = { expanded: options.expanded, isPartial: options.isPartial };
@@ -161,6 +167,7 @@ class PowerShellResultComponent implements Component {
 		this.isError = context.isError;
 		this.startedAt = context.state.startedAt;
 		this.endedAt = context.state.endedAt;
+		this.durationMs = context.durationMs;
 		if (changed) this.invalidate();
 	}
 
@@ -172,7 +179,11 @@ class PowerShellResultComponent implements Component {
 		}
 		const state = this.context.state;
 		const now = state.endedAt ?? Date.now();
-		const duration = state.startedAt === undefined ? undefined : formatDuration(now - state.startedAt);
+		const recorded = !this.options.isPartial ? asFiniteNumber(this.durationMs) : undefined;
+		const elapsed = recorded !== undefined && recorded >= 0
+			? recorded
+			: state.startedAt === undefined ? undefined : now - state.startedAt;
+		const duration = elapsed === undefined ? undefined : formatDuration(elapsed);
 		const status = this.isError
 			? `Failed${duration ? ` · Took ${duration}` : ""}`
 			: this.options.isPartial

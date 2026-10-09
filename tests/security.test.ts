@@ -111,6 +111,24 @@ test("notification metadata escapes attribute values", () => {
 	);
 });
 
+test("shell pruning preserves resolved additive, subtractive, and explicit tool selections", () => {
+	// Inputs are host-resolved active names, never raw CLI +name/-name expressions.
+	for (const selected of [
+		["read", "edit", "bash", "powershell", "pwsh", "pwsh_job", "codemode"],
+		["read", "codemode", "pwsh"],
+		["read", "codemode"],
+		[],
+	]) {
+		const before = [...selected];
+		const active = activeToolsForPowerShell(selected, true);
+		assert.deepEqual(active, selected.filter(name => !["bash", "powershell"].includes(name)));
+		assert.deepEqual(selected, before);
+		assert.ok(!active.includes("write"), "must not restore a subtracted tool");
+		assert.deepEqual(activeToolsForPowerShell(active, true), active, "reload is idempotent");
+		assert.deepEqual(activeToolsForPowerShell(selected, false), selected.filter(name => !["pwsh", "pwsh_job"].includes(name)));
+	}
+});
+
 test("the extension removes both built-in shell tools", () => {
 	assert.deepEqual(
 		activeToolsWithPwsh(["read", "bash", "powershell", "pwsh", "pwsh_job", "edit", "write"]),

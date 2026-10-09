@@ -319,6 +319,43 @@ test("unchanged call and completed-result rows reuse width-specific render cache
 	assert.notStrictEqual(component.render(40), fortyColumnResult);
 });
 
+test("recorded final duration survives restored state and invalidates cached rows", () => {
+	const toolResult = result("output");
+	const options = { expanded: false, isPartial: false };
+	for (const isError of [false, true]) {
+		const ctx = context({}, { executionStarted: false, isError, durationMs: 1250 });
+		const component = renderPowerShellResult(toolResult, options, theme, ctx);
+		assert.match(component.render(80).join("\n"), /Took 1\.3s/);
+		const cached = component.render(80);
+		ctx.durationMs = 0;
+		ctx.lastComponent = component;
+		assert.equal(renderPowerShellResult(toolResult, options, theme, ctx), component);
+		assert.notStrictEqual(component.render(80), cached);
+		assert.match(component.render(80).join("\n"), /Took 0\.0s/);
+	}
+	for (const durationMs of [undefined, NaN, Infinity, -1]) {
+		const ctx = context({}, { durationMs, state: { startedAt: 0, endedAt: 2000 } });
+		assert.match(renderPowerShellResult(toolResult, options, theme, ctx).render(80).join("\n"), /Took 2\.0s/);
+	}
+	const ctx = context({}, { durationMs: 50, state: { startedAt: 0, endedAt: 60000 } });
+	assert.match(renderPowerShellResult(toolResult, options, theme, ctx).render(80).join("\n"), /Took 0\.1s/);
+});
+
+test("host-owned output padding is not duplicated by tool renderers", () => {
+	for (const outputPad of [0, 1, 4]) {
+		for (const width of [1, 12, 40]) {
+			const args = { command: "Write-Output padding" };
+			const ctx = context(args, { outputPad, executionStarted: false });
+			const call = renderPwshCall(args, theme, ctx).render(width);
+			const output = renderPowerShellResult(result("padding"), { expanded: false, isPartial: false }, theme, ctx).render(width);
+			assertWidth(call, width);
+			assertWidth(output, width);
+			assert.ok(!call[0].startsWith(" "));
+			assert.ok(!output[0].startsWith(" "));
+		}
+	}
+});
+
 test("README documents both tool renderers and Pi's configurable expansion action", () => {
 	const readme = readFileSync(fileURLToPath(new URL("../README.md", import.meta.url)), "utf8");
 	assert.match(readme, /Both `pwsh` and `pwsh_job` use purpose-built TUI rendering/);
@@ -330,7 +367,7 @@ test("partial result timing invalidates, reuses components, and cleans up", (t) 
 	t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000 });
 	let invalidations = 0;
 	const state: PowerShellRendererState = { startedAt: Date.now() };
-	const ctx = context({}, { isPartial: true, state, invalidate: () => invalidations++ });
+	const ctx = context({}, { isPartial: true, durationMs: 999_999, state, invalidate: () => invalidations++ });
 	const partial = renderPowerShellResult(result("streaming"), { expanded: false, isPartial: true }, theme, ctx);
 	assert.ok(state.interval);
 	t.mock.timers.tick(1_000);

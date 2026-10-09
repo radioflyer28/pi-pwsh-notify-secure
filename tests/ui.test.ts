@@ -48,22 +48,26 @@ function makeListHarness() {
 	let editorText = "";
 	let customCalls = 0;
 	let viewer: any;
+	let overlayOptions: any;
+	const localTui = { ...tui, terminal: { rows: 30 }, focusedComponent: undefined as unknown };
 	let resolveCustom: ((value: undefined) => void) | undefined;
 	const ui = {
 		setWidget(key: string, content: unknown, options?: unknown) { widgets.push({ key, content, options }); },
 		onTerminalInput(next: (data: string) => unknown) { handler = next; return () => { handler = undefined; }; },
 		getEditorText() { return editorText; },
 		notify() {},
-		custom(factory: any) {
+		custom(factory: any, options: any) {
 			customCalls++;
-			viewer = factory(tui, theme, {}, () => {});
+			overlayOptions = options;
+			viewer = factory(localTui, theme, {}, () => {});
 			return new Promise<undefined>((resolve) => { resolveCustom = resolve; });
 		},
 	};
 	const list = new JobList(jobs, (job: any) => killCalls.push(job.id));
 	list.setUICtx(ui);
 	return {
-		jobs, widgets, killCalls, list,
+		jobs, widgets, killCalls, list, tui: localTui,
+		get overlayOptions() { return overlayOptions; },
 		get handler() { return handler!; },
 		get editorText() { return editorText; },
 		set editorText(value: string) { editorText = value; },
@@ -92,6 +96,32 @@ test("JobList navigation opens the viewer and respects empty-editor activation",
 	await sleep(0);
 	assert.deepEqual(harness.handler("\x1b"), { consume: true });
 	harness.list.dispose();
+});
+
+test("job overlay respects fullscreen focus ownership and resized terminal bounds", async () => {
+	const h = makeListHarness();
+	h.jobs.set("bg-1", fakeJob());
+	h.list.update();
+	h.widgets.at(-1).content(h.tui, theme);
+	// A fullscreen dialog owns focus; job navigation must not steal its keys.
+	h.tui.focusedComponent = {};
+	assert.equal(h.handler("\x1b[C"), undefined);
+	h.tui.focusedComponent = undefined;
+	assert.deepEqual(h.handler("\x1b[C"), { consume: true });
+	h.handler("\r");
+	assert.deepEqual(h.overlayOptions, { overlay: true, overlayOptions: { anchor: "center", width: "90%", maxHeight: "70%" } });
+	for (const rows of [12, 30, 60]) {
+		h.tui.terminal.rows = rows;
+		h.viewer.invalidate();
+		const lines = h.viewer.render(30);
+		assert.ok(lines.length <= Math.max(10, Math.floor(rows * 0.7)));
+		assert.equal(h.handler("\x1b[C"), undefined, "overlay owns input");
+	}
+	h.viewer.dispose();
+	h.closeViewer();
+	await sleep(0);
+	assert.deepEqual(h.handler("\x1b"), { consume: true });
+	h.list.dispose();
 });
 
 test("JobList rendering stays within terminal width", () => {

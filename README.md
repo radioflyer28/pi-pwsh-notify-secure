@@ -17,7 +17,7 @@ Pi 0.84.3 introduced an optional native `powershell` tool for ordinary foregroun
 1. Native Pi has no managed background jobs, persistent `cd`, blocking job wait, or ready/finished steering notifications.
 2. The native implementation examined at Pi 0.84.3 used unqualified executable discovery and cleanup helpers; this fork uses verified absolute executable paths and does not force `-ExecutionPolicy Bypass`.
 
-The peer floor remains Pi/TUI 0.84.3. The isolated Windows compatibility matrix targets Pi/TUI 0.84.3, 0.87.1, and 0.99.1; the locked development dependency baseline remains Pi/TUI 0.87.1. Pi 0.99 adds structured codemode results without requiring a host upgrade for ordinary tool use. See the [source-by-source Pi comparison](docs/research/pi-0.84.3-native-powershell.md), the [upstream 0.5.0 secure-adaptation matrix](docs/research/upstream-0.5.0-secure-adaptation.md), and the [upstream synchronization checklist](docs/maintenance/upstream-sync.md).
+The peer floor remains Pi/TUI 0.84.3. The isolated Windows compatibility matrix targets Pi/TUI 0.84.3, 0.87.1, 0.99.1, and 1.1.0; the locked development dependency baseline is Pi/TUI 1.1.0. Pi 0.99 adds structured codemode results without requiring a host upgrade for ordinary tool use. See the [source-by-source Pi comparison](docs/research/pi-0.84.3-native-powershell.md), the [upstream 0.5.0 secure-adaptation matrix](docs/research/upstream-0.5.0-secure-adaptation.md), and the [upstream synchronization checklist](docs/maintenance/upstream-sync.md).
 
 ### Symptoms this fixes
 
@@ -139,7 +139,7 @@ The shared runner never writes output logs. **Pi itself owns the `!`/`!!` output
 
 ## Requirements
 
-- Pi/TUI 0.84.3 or newer on Windows; locked development baseline 0.87.1, with Windows compatibility targets 0.84.3 / 0.87.1 / 0.99.1.
+- Pi/TUI 0.84.3 or newer on Windows; locked development baseline 1.1.0, with Windows compatibility targets 0.84.3 / 0.87.1 / 0.99.1 / 1.1.0.
 - PowerShell 7 (`pwsh`) is preferred — install with `winget install Microsoft.PowerShell`. Trusted Windows PowerShell 5.1 is retained as a fallback.
 
 ## Security hardening
@@ -153,9 +153,15 @@ The shared runner never writes output logs. **Pi itself owns the `!`/`!!` output
 
 Run `npm ci --ignore-scripts`, then `npm run check`. The codemode suite uses a local faux model provider with the real Pi AgentSession and QuickJS worker; it never calls a paid model. Codemode tests explicitly skip on pre-0.99 hosts; the Windows process integration suite still runs there.
 
-Use `npm run test:host -- --version 0.84.3` (also `0.87.1` or `0.99.1`) for an isolated pinned-host check. It does not alter this checkout's dependencies or installed Pi, and respects npm's release-age policy. The runner verifies host/TUI versions, shares Pi's bundled TUI registry, and retains its temporary fixture lock and evidence. Replay its full transitive dependency set with `--lock <saved-host-package-lock.json>`; the checkout's lockfile pins the shared development tools. CI runs all three on Windows and uploads fixture locks for replay.
+Use `npm run test:host -- --version 0.84.3` (also `0.87.1`, `0.99.1`, or `1.1.0`; default `1.1.0`) for an isolated pinned-host check. It does not alter this checkout's dependencies or installed Pi, and respects npm's release-age policy. The runner verifies host/TUI versions, shares Pi's bundled TUI registry, and retains its temporary fixture lock and evidence. Replay its full transitive dependency set with `--lock <saved-host-package-lock.json>`; the checkout's lockfile pins the shared development tools. CI runs all four on Windows and uploads fixture locks for replay.
 
-`--installed <absolute-Pi-package-directory>` instead tests an already-installed matching host without downloading packages; this is labeled an **installed-host smoke test**, not a clean-install test. Neither path changes the configured Pi package tag. See [Pi 0.99 assessment](docs/research/pi-0.99-package-assessment.md) for the migration rationale.
+`--installed <absolute-Pi-package-directory>` instead tests an already-installed matching host without downloading packages; this is labeled an **installed-host smoke test**, not a clean-install test. Both bundled and sibling TUI layouts are supported, including Pi's managed installation. Neither path changes the configured Pi package tag. The development pins and lockfile target 1.1.0. This upgrade used an explicitly authorized, command-scoped `--min-release-age=0` override; the persistent seven-day npm release-age policy was not changed. Normal installs and the host runner continue to respect the configured policy. Local junctions to an installed host are not evidence of the locked baseline. See [Pi 0.99 assessment](docs/research/pi-0.99-package-assessment.md) for the migration rationale.
+
+### Pi 1.1.0 rendering and manual smoke checks
+
+Completed tool rows prefer Pi's persisted `durationMs`, including after session reload; older hosts retain the live-timer fallback. Pi owns tool-shell `outputPad`, so these renderers do not add a second padding layer. No minimum-host bump or notification-protocol change is required.
+
+For interactive verification, test both `--tui-mode fullscreen` and `--tui-mode regular`, with `outputPad` set to 0 and a nonzero value: start a background job, enter the list with Right/Tab from an empty editor, open/close its overlay, resize the terminal, and reload a completed foreground result. Confirm timing survives reload, no duplicate padding appears, and other dialogs keep keyboard focus. Component tests cover focus/resize contracts but do not replace this terminal smoke check. On Pi 1.1.0, also check `--tools +codemode,-write`: secure shell pruning must preserve the selected non-shell tools and must not restore disabled tools.
 
 ## Notes
 
@@ -203,7 +209,7 @@ agent 在后台启动构建或 dev server 后可以继续和你对话；进程�
 
 ### 要求
 
-Pi/TUI 0.84.3 或更高版本，运行于 Windows；开发与 smoke test 目标为 0.87.1。建议 PowerShell 7（`winget install Microsoft.PowerShell`），未安装时保留可信的 Windows PowerShell 5.1 回退。`!`/`!!` 也会使用同一安全 PowerShell runtime；若找不到可信 runtime，本扩展工具停用并保留 Pi 内置 shell。
+Pi/TUI 0.84.3 或更高版本，运行于 Windows；锁定开发基线为 1.1.0；Windows 兼容测试目标为 0.84.3 / 0.87.1 / 0.99.1 / 1.1.0。建议 PowerShell 7（`winget install Microsoft.PowerShell`），未安装时保留可信的 Windows PowerShell 5.1 回退。`!`/`!!` 也会使用同一安全 PowerShell runtime；若找不到可信 runtime，本扩展工具停用并保留 Pi 内置 shell。
 
 ## License
 
