@@ -31,9 +31,9 @@ test("documentation distinguishes Pi 1.1.0 compatibility from the locked develop
 	assert.match(readme, /fullscreen.*regular/);
 });
 
-test("release metadata and installation instructions use 0.5.0-secure.6", () => {
-	assert.equal(packageJson.version, "0.5.0-secure.6");
-	assert.match(readme, /pi-pwsh-notify-secure@v0\.5\.0-secure\.6/);
+test("release metadata and installation instructions use 0.5.0-secure.7", () => {
+	assert.equal(packageJson.version, "0.5.0-secure.7");
+	assert.match(readme, /pi-pwsh-notify-secure@v0\.5\.0-secure\.7/);
 });
 
 test("documentation records the secure upstream adaptation and compatibility behavior", () => {
