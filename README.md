@@ -17,7 +17,7 @@ Pi 0.84.3 introduced an optional native `powershell` tool for ordinary foregroun
 1. Native Pi has no managed background jobs, persistent `cd`, blocking job wait, or ready/finished steering notifications.
 2. The native implementation examined at Pi 0.84.3 used unqualified executable discovery and cleanup helpers; this fork uses verified absolute executable paths and does not force `-ExecutionPolicy Bypass`.
 
-The peer floor remains Pi/TUI 0.84.3. The isolated Windows compatibility matrix targets Pi/TUI 0.84.3, 0.87.1, 0.99.1, and 1.1.0; the locked development dependency baseline is Pi/TUI 1.1.0. Pi 0.99 adds structured codemode results without requiring a host upgrade for ordinary tool use. See the [source-by-source Pi comparison](docs/research/pi-0.84.3-native-powershell.md), the [upstream 0.5.0 secure-adaptation matrix](docs/research/upstream-0.5.0-secure-adaptation.md), and the [upstream synchronization checklist](docs/maintenance/upstream-sync.md).
+The peer floor remains Pi/TUI 0.84.3. The isolated Windows compatibility matrix targets Pi/TUI 0.84.3, 0.87.1, 0.99.1, 1.1.0, and 1.2.0; the locked development dependency baseline is Pi/TUI 1.1.0. Pi 0.99 adds structured codemode results without requiring a host upgrade for ordinary tool use. See the [source-by-source Pi comparison](docs/research/pi-0.84.3-native-powershell.md), the [upstream 0.5.0 secure-adaptation matrix](docs/research/upstream-0.5.0-secure-adaptation.md), and the [upstream synchronization checklist](docs/maintenance/upstream-sync.md).
 
 ### Symptoms this fixes
 
@@ -49,7 +49,7 @@ Two tools, Claude Code-shaped: background execution is a parameter, not a separa
 | `pwsh` | Run a command (replaces built-in `bash`). `run_in_background: true` starts a job that **auto-notifies on exit**; `notify_on` (regex) adds a **ready notification** for servers that never exit |
 | `pwsh_job` | Background job management: incremental output / **blocking wait** (Claude Code's Monitor) / list / kill (`taskkill /T /F`) |
 
-### Structured results on Pi 0.99 (unreleased)
+### Structured results on Pi 0.99 and newer
 
 The tools keep their default **direct** exposure and are callable from codemode while active. `outputSchema`/`structuredContent` provide discriminated results: `foreground`, `background`, `list`, `output`, `wait`, and `stop`. Older hosts continue receiving text and execution details; failed foreground commands still throw through the backward-compatible error hook.
 
@@ -139,7 +139,7 @@ The shared runner never writes output logs. **Pi itself owns the `!`/`!!` output
 
 ## Requirements
 
-- Pi/TUI 0.84.3 or newer on Windows; locked development baseline 1.1.0, with Windows compatibility targets 0.84.3 / 0.87.1 / 0.99.1 / 1.1.0.
+- Pi/TUI 0.84.3 or newer on Windows; locked development baseline 1.1.0, with Windows compatibility targets 0.84.3 / 0.87.1 / 0.99.1 / 1.1.0 / 1.2.0.
 - PowerShell 7 (`pwsh`) is preferred — install with `winget install Microsoft.PowerShell`. Trusted Windows PowerShell 5.1 is retained as a fallback.
 
 ## Security hardening
@@ -153,7 +153,7 @@ The shared runner never writes output logs. **Pi itself owns the `!`/`!!` output
 
 Run `npm ci --ignore-scripts`, then `npm run check`. The codemode suite uses a local faux model provider with the real Pi AgentSession and QuickJS worker; it never calls a paid model. Codemode tests explicitly skip on pre-0.99 hosts; the Windows process integration suite still runs there.
 
-Use `npm run test:host -- --version 0.84.3` (also `0.87.1`, `0.99.1`, or `1.1.0`; default `1.1.0`) for an isolated pinned-host check. It does not alter this checkout's dependencies or installed Pi, and respects npm's release-age policy. The runner verifies host/TUI versions, shares Pi's bundled TUI registry, and retains its temporary fixture lock and evidence. Replay its full transitive dependency set with `--lock <saved-host-package-lock.json>`; the checkout's lockfile pins the shared development tools. CI runs all four on Windows and uploads fixture locks for replay.
+Use `npm run test:host -- --version 0.84.3` (also `0.87.1`, `0.99.1`, `1.1.0`, or `1.2.0`; default `1.1.0`) for an isolated pinned-host check. It does not alter this checkout's dependencies or installed Pi, and respects npm's release-age policy. The runner verifies host/TUI versions, shares Pi's bundled TUI registry, and retains its temporary fixture lock and evidence. Replay its full transitive dependency set with `--lock <saved-host-package-lock.json>`; the checkout's lockfile pins the shared development tools. CI runs all five on Windows and uploads fixture locks for replay.
 
 `--installed <absolute-Pi-package-directory>` instead tests an already-installed matching host without downloading packages; this is labeled an **installed-host smoke test**, not a clean-install test. Both bundled and sibling TUI layouts are supported, including Pi's managed installation. Neither path changes the configured Pi package tag. The development pins and lockfile target 1.1.0. This upgrade used an explicitly authorized, command-scoped `--min-release-age=0` override; the persistent seven-day npm release-age policy was not changed. Normal installs and the host runner continue to respect the configured policy. Local junctions to an installed host are not evidence of the locked baseline. See [Pi 0.99 assessment](docs/research/pi-0.99-package-assessment.md) for the migration rationale.
 
@@ -162,6 +162,14 @@ Use `npm run test:host -- --version 0.84.3` (also `0.87.1`, `0.99.1`, or `1.1.0`
 Completed tool rows prefer Pi's persisted `durationMs`, including after session reload; older hosts retain the live-timer fallback. Pi owns tool-shell `outputPad`, so these renderers do not add a second padding layer. No minimum-host bump or notification-protocol change is required.
 
 For interactive verification, test both `--tui-mode fullscreen` and `--tui-mode regular`, with `outputPad` set to 0 and a nonzero value: start a background job, enter the list with Right/Tab from an empty editor, open/close its overlay, resize the terminal, and reload a completed foreground result. Confirm timing survives reload, no duplicate padding appears, and other dialogs keep keyboard focus. Component tests cover focus/resize contracts but do not replace this terminal smoke check. On Pi 1.1.0, also check `--tools +codemode,-write`: secure shell pruning must preserve the selected non-shell tools and must not restore disabled tools.
+
+### Pi 1.2.0 notification lifecycle
+
+Idle background notifications now pass through Pi's `before_agent_start` as `messageType: "custom"`, with the starting `message` and no `prompt`. Integrations inspecting user prompts must narrow to `messageType: "user"`. Pi is busy during startup (`ctx.isIdle()` is false), so a notification arriving during a startup handler steers into that run instead of starting a competing run. The real-host suite covers both cases and checks that prompt sections survive the custom run's tool follow-up.
+
+Process/signal cleanup hooks are installed idempotently at `session_start`, not while loading the factory for resource discovery. The terminal job list is TUI-only; RPC/JSON/print retain execution and metadata-only notifications without registering terminal input. The default-direct tool exposure, schemas, legacy error bridge, peer floor, and locked 1.1.0 development dependencies are unchanged. No `reachesTools` or namespace is needed: these tools execute processes, not other Pi tools.
+
+To validate against a managed 1.2.0 installation without changing dependencies or Pi settings, run `npm run test:host -- --version 1.2.0 --installed '<absolute path to @earendil-works/pi-coding-agent>'`. This is an installed-host smoke check, not a pinned clean install.
 
 ## Notes
 
@@ -209,7 +217,7 @@ agent 在后台启动构建或 dev server 后可以继续和你对话；进程�
 
 ### 要求
 
-Pi/TUI 0.84.3 或更高版本，运行于 Windows；锁定开发基线为 1.1.0；Windows 兼容测试目标为 0.84.3 / 0.87.1 / 0.99.1 / 1.1.0。建议 PowerShell 7（`winget install Microsoft.PowerShell`），未安装时保留可信的 Windows PowerShell 5.1 回退。`!`/`!!` 也会使用同一安全 PowerShell runtime；若找不到可信 runtime，本扩展工具停用并保留 Pi 内置 shell。
+Pi/TUI 0.84.3 或更高版本，运行于 Windows；锁定开发基线为 1.1.0；Windows 兼容测试目标为 0.84.3 / 0.87.1 / 0.99.1 / 1.1.0 / 1.2.0。建议 PowerShell 7（`winget install Microsoft.PowerShell`），未安装时保留可信的 Windows PowerShell 5.1 回退。`!`/`!!` 也会使用同一安全 PowerShell runtime；若找不到可信 runtime，本扩展工具停用并保留 Pi 内置 shell。
 
 ## License
 

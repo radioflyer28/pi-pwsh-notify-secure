@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 
 // Isolate host versions; never mutate repo node_modules, lockfile, installed Pi, or npm age policy.
-const versions = ["0.84.3", "0.87.1", "0.99.1", "1.1.0"];
+const versions = ["0.84.3", "0.87.1", "0.99.1", "1.1.0", "1.2.0"];
 const args = process.argv.slice(2);
 const option = (name: string) => args[args.indexOf(name) + 1];
 const version = args.includes("--version") ? option("--version") : "1.1.0";

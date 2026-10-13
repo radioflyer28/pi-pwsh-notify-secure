@@ -16,6 +16,9 @@ const host: any = piHost;
 const supported = typeof host.createCodemodeExtension === "function";
 const require = createRequire(import.meta.url);
 const hostRequire = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
+const hostVersion = JSON.parse(await readFile(new URL("../package.json", import.meta.resolve("@earendil-works/pi-coding-agent")), "utf8")).version;
+const [hostMajor, hostMinor] = hostVersion.split(".").map(Number);
+const hasCustomRunSetup = hostMajor > 1 || (hostMajor === 1 && hostMinor >= 2);
 async function hostImport(name: string, subpath = ".") {
 	const base = hostRequire.resolve.paths(name)?.find(p => existsSync(join(p, name, "package.json")));
 	assert.ok(base, `Host dependency not found: ${name}`);
@@ -52,7 +55,11 @@ async function setup(extra: ((pi: any) => void)[] = [], before: ((pi: any) => vo
 	await loader.reload();
 	assert.deepEqual(loader.getExtensions().errors, []);
 	const manager = host.SessionManager.inMemory(dir);
-	const agent = new core.Agent({ getApiKey: () => "faux-key", streamFn: ai.streamSimple,
+	const requests: any[][] = [];
+	const agent = new core.Agent({ getApiKey: () => "faux-key", streamFn: (model: any, context: any, options: any) => {
+		requests.push(structuredClone(context.messages));
+		return ai.streamSimple(model, context, options);
+	},
 		initialState: { model, systemPrompt: "Test", tools: [] }, convertToLlm: host.convertToLlm });
 	const session = new host.AgentSession({ agent, sessionManager: manager, settingsManager: settings,
 		cwd: dir, modelRuntime: runtime, resourceLoader: loader, initialActiveToolNames: ["pwsh", "pwsh_job", "codemode"] });
@@ -60,7 +67,7 @@ async function setup(extra: ((pi: any) => void)[] = [], before: ((pi: any) => vo
 	session.subscribe((event: any) => events.push(event));
 	await session.bindExtensions({});
 	return {
-		dir, session, events, manager,
+		dir, session, events, manager, faux, ai, requests,
 		async run(code: string) {
 			faux.setResponses([ai.fauxAssistantMessage([ai.fauxToolCall("codemode", { code })], { stopReason: "toolUse" }), ai.fauxAssistantMessage("done")]);
 			await session.prompt("execute test");
@@ -266,4 +273,77 @@ test("codemode: content-only redaction drops structured output instead of leakin
 	try {
 		assert.equal(value(await early.run(`try { await tools.pwsh({command:"Write-Output PRIVATE; exit 2"}); } catch(e) { return {error:e.message}; }`)).error, "early redaction");
 	} finally { await early.close(); }
+});
+
+async function waitUntil(predicate: () => boolean): Promise<void> {
+	const deadline = Date.now() + 10_000;
+	while (!predicate()) {
+		assert.ok(Date.now() < deadline, "timed out waiting for background notification");
+		await sleep(20);
+	}
+}
+
+test("Pi 1.2: idle background notification starts a custom run and retains prompt sections after tools", { skip: !enabled || !hasCustomRunSetup, timeout: 15000 }, async () => {
+	const starts: any[] = [];
+	const h = await setup([(pi: any) => {
+		pi.on("before_agent_start", (event: any, ctx: any) => {
+			starts.push({ messageType: event.messageType, prompt: event.prompt, message: event.message, idle: ctx.isIdle() });
+			event.systemPromptOptions.sections.pwsh_audit = "PWSH_CUSTOM_RUN_GUIDANCE";
+		});
+	}]);
+	try {
+		value(await h.run(`return await tools.pwsh({command:"Start-Sleep -Seconds 2; Write-Output PRIVATE_IDLE_OUTPUT", run_in_background:true});`));
+		assert.equal(h.session.isIdle, true);
+		h.faux.setResponses([
+			h.ai.fauxAssistantMessage([h.ai.fauxToolCall("codemode", { code: `return await tools.pwsh_job({action:"list"});` })], { stopReason: "toolUse" }),
+			h.ai.fauxAssistantMessage("notification handled"),
+		]);
+		await waitUntil(() => starts.some(s => s.messageType === "custom") && h.session.isIdle);
+		assert.deepEqual(starts.map(s => s.messageType), ["user", "custom"]);
+		const custom = starts[1];
+		assert.equal(custom.prompt, undefined);
+		assert.equal(custom.message.customType, "pwsh-bg-notify");
+		assert.equal(custom.idle, false);
+		assert.equal(starts[0].idle, false);
+		assert.equal(h.requests.length, 4, "both runs must make a request after their tool result");
+		for (const messages of h.requests) {
+			const sections: Record<string, string | null> = {};
+			for (const message of messages) if (message.role === "system") Object.assign(sections, message.sections);
+			assert.match(sections.pwsh_audit ?? "", /PWSH_CUSTOM_RUN_GUIDANCE/, "provider-bound transcript must retain the section after tools");
+			assert.doesNotMatch(Object.values(sections).filter(Boolean).join("\n"), /Use `bash`/);
+		}
+		const notices = h.session.messages.filter((m: any) => m.role === "custom" && m.customType === "pwsh-bg-notify");
+		assert.equal(notices.length, 1);
+		assert.doesNotMatch(JSON.stringify(notices), /PRIVATE_IDLE_OUTPUT|Write-Output/);
+		assert.equal(h.events.filter(e => e.type === "agent_start").length, 2);
+	} finally { await h.close(); }
+});
+
+test("Pi 1.2: background notification during before_agent_start queues into the starting user run", { skip: !enabled || !hasCustomRunSetup, timeout: 15000 }, async () => {
+	const starts: any[] = [];
+	let holdStart = false;
+	let idleDuringStart: boolean | undefined;
+	let queuedDuringStart = false;
+	const h = await setup([(pi: any) => {
+		pi.on("before_agent_start", async (event: any, ctx: any) => {
+			starts.push(event.messageType);
+			if (!holdStart) return;
+			idleDuringStart = ctx.isIdle();
+			await waitUntil(() => h.session.agent.peekQueuedMessages().some((m: any) => m.role === "custom" && m.customType === "pwsh-bg-notify"));
+			queuedDuringStart = true;
+		});
+	}]);
+	try {
+		value(await h.run(`return await tools.pwsh({command:"Start-Sleep -Seconds 2; Write-Output PRIVATE_START_OUTPUT", run_in_background:true});`));
+		holdStart = true;
+		const result = value(await h.run(`return await tools.pwsh_job({action:"list"});`));
+		assert.equal(result.kind, "list");
+		assert.equal(idleDuringStart, false);
+		assert.equal(queuedDuringStart, true);
+		assert.deepEqual(starts, ["user", "user"], "notification must not start a competing custom run");
+		assert.equal(h.events.filter(e => e.type === "agent_start").length, 2);
+		const notices = h.session.messages.filter((m: any) => m.role === "custom" && m.customType === "pwsh-bg-notify");
+		assert.equal(notices.length, 1);
+		assert.doesNotMatch(JSON.stringify(notices), /PRIVATE_START_OUTPUT|Write-Output/);
+	} finally { await h.close(); }
 });

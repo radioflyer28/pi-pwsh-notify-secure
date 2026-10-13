@@ -30,6 +30,7 @@ const { buildPowerShellScript, resolvePowerShellRuntime, spawnPowerShell } = run
 interface HarnessOptions {
   cwd?: string;
   sendFailures?: number;
+  mode?: "tui" | "rpc" | "json" | "print";
 }
 
 function makeHarness(options: HarnessOptions = {}) {
@@ -39,10 +40,11 @@ function makeHarness(options: HarnessOptions = {}) {
   let activeTools = ["read", "bash", "powershell", "grep", "find"];
   let sendFailures = options.sendFailures ?? 0;
   let sendAttempts = 0;
+  let terminalInputRegistrations = 0;
   const ui = {
     setStatus() {},
     setWidget() {},
-    onTerminalInput() { return () => {}; },
+    onTerminalInput() { terminalInputRegistrations++; return () => {}; },
     getEditorText() { return ""; },
     notify() {},
     async custom() {},
@@ -69,8 +71,8 @@ function makeHarness(options: HarnessOptions = {}) {
   pwshNotifyExtension(pi);
   const ctx = {
     cwd: options.cwd ?? REPO,
-    hasUI: false,
-    mode: "rpc",
+    hasUI: options.mode === "tui" || options.mode === "rpc",
+    mode: options.mode ?? "rpc",
     ui,
     sessionManager: {
       getSessionId: () => "test-session",
@@ -84,6 +86,7 @@ function makeHarness(options: HarnessOptions = {}) {
     messages,
     get activeTools() { return [...activeTools]; },
     get sendAttempts() { return sendAttempts; },
+    get terminalInputRegistrations() { return terminalInputRegistrations; },
     fire(event: string, payload: any = { type: event }) {
       for (const handler of eventHandlers.get(event) ?? []) handler(payload, ctx);
     },
@@ -130,6 +133,35 @@ test("public wrapper mock satisfies the selected host contract before testing ex
     assert.equal(result.isError, false, textOf(result));
     assert.equal(result.details?.probe, true);
   } finally { await h.emit("session_shutdown"); }
+});
+
+test("session lifecycle: factory is side-effect free and process hooks start and stop idempotently", async () => {
+  const signals = ["exit", "SIGHUP", "SIGBREAK", "SIGTERM"] as const;
+  const counts = () => signals.map(signal => process.listenerCount(signal));
+  const initial = counts();
+  const h = makeHarness();
+  assert.deepEqual(counts(), initial, "resource discovery must not install process hooks");
+  try {
+    h.fire("session_start");
+    assert.deepEqual(counts(), initial.map(n => n + 1));
+    h.fire("session_start");
+    assert.deepEqual(counts(), initial.map(n => n + 1), "repeated start must not duplicate hooks");
+    await h.emit("session_shutdown");
+    assert.deepEqual(counts(), initial);
+    await h.emit("session_shutdown");
+    assert.deepEqual(counts(), initial, "repeated shutdown must remain safe");
+  } finally { await h.emit("session_shutdown"); }
+});
+
+test("job list registers terminal input only in TUI, not RPC/JSON/print", async () => {
+  for (const mode of ["tui", "rpc", "json", "print"] as const) {
+    const h = makeHarness({ mode });
+    try {
+      h.fire("tool_execution_start");
+      h.fire("tool_execution_start");
+      assert.equal(h.terminalInputRegistrations, mode === "tui" ? 1 : 0, mode);
+    } finally { await h.emit("session_shutdown"); }
+  }
 });
 
 // Pure harness tests remain runnable on non-Windows CI.

@@ -339,7 +339,7 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 	// during tool execution; the job list registers its widget + key handler here.
 	pi.on("tool_execution_start", (_event, ctx) => {
 		uiCtx = ctx;
-		jobList.setUICtx(ctx.ui as unknown as JobListUICtx);
+		if (ctx.mode === "tui") jobList.setUICtx(ctx.ui as unknown as JobListUICtx);
 	});
 
 	// ------------------------------------------------------------------
@@ -473,8 +473,13 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 		reap();
 		setTimeout(() => process.exit(0), 500).unref?.();
 	};
-	process.on("exit", reap);
-	for (const sig of SIGNALS) process.on(sig, onSignal);
+	let processHooksRegistered = false;
+	pi.on("session_start", () => {
+		if (processHooksRegistered) return;
+		process.on("exit", reap);
+		for (const sig of SIGNALS) process.on(sig, onSignal);
+		processHooksRegistered = true;
+	});
 	// Session teardown (quit, reload, /new, /resume, /fork): kill the jobs —
 	// they belong to this session and a fresh extension instance cannot take
 	// them over — and unregister everything registered above so repeated
@@ -485,6 +490,7 @@ export default function pwshNotifyExtension(pi: ExtensionAPI) {
 		reap();
 		process.off("exit", reap);
 		for (const sig of SIGNALS) process.off(sig, onSignal);
+		processHooksRegistered = false;
 		jobList.dispose();
 		let timer: NodeJS.Timeout | undefined;
 		try {
