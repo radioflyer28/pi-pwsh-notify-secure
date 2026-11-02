@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 
 // Isolate host versions; never mutate repo node_modules, lockfile, installed Pi, or npm age policy.
-const versions = ["0.84.3", "0.87.1", "0.99.1", "1.1.0", "1.2.0"];
+const versions = ["0.84.3", "0.87.1", "0.99.1", "1.1.0", "1.2.0", "1.5.0"];
 const args = process.argv.slice(2);
 const option = (name: string) => args[args.indexOf(name) + 1];
 const version = args.includes("--version") ? option("--version") : "1.1.0";
@@ -31,7 +31,10 @@ if (args.includes("--installed")) {
 	await writeFile(join(fixture, "package.json"), JSON.stringify({ private: true, dependencies: {
 		"@earendil-works/pi-coding-agent": version, "@earendil-works/pi-tui": version,
 	}, overrides: {
+		// These packages share a release train; ^1.x can otherwise mix incompatible APIs.
 		"@earendil-works/pi-tui": version, "@earendil-works/pi-agent-core": version, "@earendil-works/pi-ai": version,
+		"@earendil-works/pi-codemode": version, "@earendil-works/pi-mcp": version,
+		"@earendil-works/chord": version, "@earendil-works/pi-client": version, "@earendil-works/pi-protocol": version,
 	} }, null, 2));
 	// Optional saved fixture lock enables exact replay of every transitive dependency.
 	if (args.includes("--lock")) await cp(resolve(option("--lock")), join(fixture, "package-lock.json"));
@@ -47,7 +50,7 @@ for (const directory of [host, tui]) {
 }
 const work = join(sandbox, "package");
 await mkdir(work);
-for (const path of ["src", "tests", "test", "docs", "README.md", "package.json", "tsconfig.json"]) {
+for (const path of ["src", "tests", "test", "docs", "scripts", ".github", "README.md", "package.json", "tsconfig.json"]) {
 	await cp(join(repo, path), join(work, path), { recursive: true });
 }
 const links: Record<string, string> = {

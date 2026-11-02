@@ -31,6 +31,22 @@ test("documentation distinguishes Pi 1.1.0 compatibility from the locked develop
 	assert.match(readme, /fullscreen.*regular/);
 });
 
+test("host fixtures pin coordinated Pi packages and include Pi 1.5 without changing the default", async () => {
+	const runner = await readFile(new URL("../scripts/test-host.mts", import.meta.url), "utf8");
+	const workflow = await readFile(new URL("../.github/workflows/compatibility.yml", import.meta.url), "utf8");
+	const versions = ["0.84.3", "0.87.1", "0.99.1", "1.1.0", "1.2.0", "1.5.0"];
+	const runnerVersions = JSON.parse(runner.match(/const versions = (\[[^;]+\]);/)![1]);
+	const matrixVersions = JSON.parse(workflow.match(/pi: (\[[^\n]+\])/)![1]);
+	assert.deepEqual(runnerVersions, versions);
+	assert.deepEqual(matrixVersions, versions);
+	assert.match(runner, /: "1\.1\.0";/);
+	const overrides = runner.split("overrides: {")[1].split("} }, null, 2)")[0];
+	for (const name of ["pi-tui", "pi-agent-core", "pi-ai", "pi-codemode", "pi-mcp", "chord", "pi-client", "pi-protocol"]) {
+		assert.ok(overrides.includes(`"@earendil-works/${name}": version`), `${name} must use the selected release`);
+	}
+	assert.doesNotMatch(runner, /--min-release-age/);
+});
+
 test("release metadata and installation instructions use 0.5.0-secure.7", () => {
 	assert.equal(packageJson.version, "0.5.0-secure.7");
 	assert.match(readme, /pi-pwsh-notify-secure@v0\.5\.0-secure\.7/);

@@ -1,5 +1,5 @@
 import {
-	keyHint,
+	keyHint as legacyKeyHint,
 	truncateToVisualLines,
 	type AgentToolResult,
 	type Theme,
@@ -56,6 +56,8 @@ export interface PowerShellRenderContext<TArgs = unknown> {
 	durationMs?: number;
 	/** Host-owned shell padding; this renderer must not apply it again. */
 	outputPad?: number;
+	/** Pi 1.5+ supplies the host's keybinding registry, not an extension SDK copy. */
+	keyHint?: typeof legacyKeyHint;
 }
 
 function asString(value: unknown): string | undefined {
@@ -75,9 +77,17 @@ function formatDuration(ms: number): string {
 	return minutes < 60 ? `${minutes}m ${remainder}s` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 }
 
-function expansionLabels(hidden: number, direction: "more" | "earlier"): [string, string] {
+function expansionHint(context: PowerShellRenderContext<unknown>): string {
+	// Only absent capabilities fall back; an injected empty hint means unbound.
+	return context.keyHint
+		? context.keyHint("app.tools.expand", "to expand")
+		: legacyKeyHint("app.tools.expand", "to expand");
+}
+
+function expansionLabels(hidden: number, direction: "more" | "earlier", hint: string): string[] {
 	const noun = hidden === 1 ? "line" : "lines";
-	return [`…${hidden} ${direction} ${noun}`, keyHint("app.tools.expand", "to expand")];
+	const label = `…${hidden} ${direction} ${noun}`;
+	return hint ? [label, hint] : [label];
 }
 
 function fitLines(lines: string[], width: number): string[] {
@@ -87,12 +97,12 @@ function fitLines(lines: string[], width: number): string[] {
 	);
 }
 
-function renderHead(text: string, width: number, expanded: boolean, maxLines = CALL_PREVIEW_LINES): string[] {
+function renderHead(text: string, width: number, expanded: boolean, hint: string, maxLines = CALL_PREVIEW_LINES): string[] {
 	const safeWidth = Math.max(1, width);
 	const lines = wrapTextWithAnsi(text, safeWidth);
 	if (expanded || lines.length <= maxLines) return fitLines(lines, safeWidth);
 	const shown = lines.slice(0, maxLines);
-	return fitLines([...shown, ...expansionLabels(lines.length - shown.length, "more")], safeWidth);
+	return fitLines([...shown, ...expansionLabels(lines.length - shown.length, "more", hint)], safeWidth);
 }
 
 function textOutput(result: AgentToolResult<unknown>): string {
@@ -105,13 +115,15 @@ function textOutput(result: AgentToolResult<unknown>): string {
 class PowerShellCallComponent implements Component {
 	private text = "";
 	private expanded = false;
+	private hint = "";
 	private cachedWidth?: number;
 	private cachedLines?: string[];
 
-	update(text: string, expanded: boolean): void {
-		if (text === this.text && expanded === this.expanded) return;
+	update(text: string, expanded: boolean, hint: string): void {
+		if (text === this.text && expanded === this.expanded && hint === this.hint) return;
 		this.text = text;
 		this.expanded = expanded;
+		this.hint = hint;
 		this.invalidate();
 	}
 
@@ -119,7 +131,7 @@ class PowerShellCallComponent implements Component {
 		const safeWidth = Math.max(1, width);
 		if (this.cachedWidth === safeWidth && this.cachedLines) return this.cachedLines;
 		this.cachedWidth = safeWidth;
-		this.cachedLines = renderHead(this.text, safeWidth, this.expanded);
+		this.cachedLines = renderHead(this.text, safeWidth, this.expanded, this.hint);
 		return this.cachedLines;
 	}
 
@@ -139,6 +151,7 @@ class PowerShellResultComponent implements Component {
 	private startedAt?: number;
 	private endedAt?: number;
 	private durationMs?: number;
+	private hint = "";
 	private cachedWidth?: number;
 	private cachedTimeSecond?: number;
 	private cachedLines?: string[];
@@ -150,6 +163,8 @@ class PowerShellResultComponent implements Component {
 		context: PowerShellRenderContext<unknown>,
 	): void {
 		const resultChanged = result !== this.result;
+		// Compare rendered text, not callback identity: the host can reconfigure a stable helper.
+		const hint = expansionHint(context);
 		const changed =
 			resultChanged ||
 			options.expanded !== this.options.expanded ||
@@ -158,7 +173,8 @@ class PowerShellResultComponent implements Component {
 			context.isError !== this.isError ||
 			context.state.startedAt !== this.startedAt ||
 			context.state.endedAt !== this.endedAt ||
-			context.durationMs !== this.durationMs;
+			context.durationMs !== this.durationMs ||
+			hint !== this.hint;
 		this.result = result;
 		if (resultChanged) this.output = textOutput(result).trim();
 		this.options = { expanded: options.expanded, isPartial: options.isPartial };
@@ -168,6 +184,7 @@ class PowerShellResultComponent implements Component {
 		this.startedAt = context.state.startedAt;
 		this.endedAt = context.state.endedAt;
 		this.durationMs = context.durationMs;
+		this.hint = hint;
 		if (changed) this.invalidate();
 	}
 
@@ -202,7 +219,7 @@ class PowerShellResultComponent implements Component {
 			} else {
 				const preview = truncateToVisualLines(styled, RESULT_PREVIEW_LINES, safeWidth);
 				if (preview.skippedCount > 0) {
-					lines.push(...fitLines(expansionLabels(preview.skippedCount, "earlier"), safeWidth));
+					lines.push(...fitLines(expansionLabels(preview.skippedCount, "earlier", this.hint), safeWidth));
 				}
 				lines.push(...fitLines(preview.visualLines, safeWidth));
 			}
@@ -233,7 +250,7 @@ function reuseCallComponent(
 		context.lastComponent instanceof PowerShellCallComponent
 			? context.lastComponent
 			: new PowerShellCallComponent();
-	component.update(text, expanded);
+	component.update(text, expanded, expansionHint(context));
 	return component;
 }
 

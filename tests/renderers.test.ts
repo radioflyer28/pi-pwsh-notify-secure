@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
-import { initTheme, type AgentToolResult, type Theme } from "@earendil-works/pi-coding-agent";
+import { initTheme, ToolExecutionComponent, type AgentToolResult, type Theme } from "@earendil-works/pi-coding-agent";
 import { KeybindingsManager, setKeybindings, visibleWidth, type KeyId } from "@earendil-works/pi-tui";
 import {
 	renderPowerShellResult,
@@ -317,6 +317,122 @@ test("unchanged call and completed-result rows reuse width-specific render cache
 	assert.strictEqual(component.render(40), fortyColumnResult);
 	component.invalidate();
 	assert.notStrictEqual(component.render(40), fortyColumnResult);
+});
+
+test("both tools prefer injected hints and invalidate caches when a stable helper changes", () => {
+	installExpandBinding("ctrl+o");
+	for (const item of [
+		{ args: { command: "command\n".repeat(10) }, renderCall: renderPwshCall },
+		{ args: { action: "wait", pattern: "long-pattern|".repeat(40) }, renderCall: renderPwshJobCall },
+	]) {
+		let shortcut = "HOST+SENTINEL";
+		const ctx = context(item.args, {
+			keyHint: (action, description) => {
+				assert.equal(action, "app.tools.expand");
+				assert.equal(description, "to expand");
+				return shortcut ? `${shortcut} ${description}` : "";
+			},
+		});
+		const toolResult = result("output\n".repeat(10));
+		const options = { expanded: false, isPartial: false };
+		const call = item.renderCall(item.args, theme, ctx);
+		const output = renderPowerShellResult(toolResult, options, theme, ctx);
+		let oldCall = call.render(80);
+		let oldOutput = output.render(80);
+		for (const lines of [oldCall, oldOutput]) {
+			assert.match(lines.join("\n"), /HOST\+SENTINEL to expand/);
+			assert.doesNotMatch(lines.join("\n"), /ctrl\+o/);
+		}
+		for (shortcut of ["HOST+CHANGED", ""]) {
+			ctx.lastComponent = call;
+			assert.strictEqual(item.renderCall(item.args, theme, ctx), call);
+			ctx.lastComponent = output;
+			assert.strictEqual(renderPowerShellResult(toolResult, options, theme, ctx), output);
+			assert.notStrictEqual(call.render(80), oldCall);
+			assert.notStrictEqual(output.render(80), oldOutput);
+			for (const component of [call, output]) {
+				const lines = renderVisible(component, 80);
+				assertWidth(lines, 80);
+				assert.doesNotMatch(lines.join("\n"), /HOST\+SENTINEL|ctrl\+o/);
+				if (shortcut) assert.match(lines.join("\n"), /HOST\+CHANGED to expand/);
+				else assert.doesNotMatch(lines.join("\n"), /to expand/);
+			}
+			oldCall = call.render(80);
+			oldOutput = output.render(80);
+			ctx.lastComponent = call;
+			item.renderCall(item.args, theme, ctx);
+			ctx.lastComponent = output;
+			renderPowerShellResult(toolResult, options, theme, ctx);
+			assert.strictEqual(call.render(80), oldCall);
+			assert.strictEqual(output.render(80), oldOutput);
+		}
+	}
+});
+
+test("older contexts retain configured legacy hints and refresh reused rows", () => {
+	for (const item of [
+		{ args: { command: "legacy\n".repeat(10) }, renderCall: renderPwshCall },
+		{ args: { action: "wait", pattern: "legacy|".repeat(80) }, renderCall: renderPwshJobCall },
+	]) {
+		installExpandBinding("ctrl+o");
+		const ctx = context(item.args);
+		const options = { expanded: false, isPartial: false };
+		const toolResult = result("legacy\n".repeat(10));
+		const call = item.renderCall(item.args, theme, ctx);
+		const output = renderPowerShellResult(toolResult, options, theme, ctx);
+		for (const component of [call, output]) assert.match(renderVisible(component, 80).join("\n"), /ctrl\+o to expand/);
+		installExpandBinding("alt+x");
+		ctx.lastComponent = call;
+		assert.strictEqual(item.renderCall(item.args, theme, ctx), call);
+		ctx.lastComponent = output;
+		assert.strictEqual(renderPowerShellResult(toolResult, options, theme, ctx), output);
+		for (const component of [call, output]) {
+			const text = renderVisible(component, 80).join("\n");
+			assert.match(text, /alt\+x to expand/);
+			assert.doesNotMatch(text, /ctrl\+o/);
+		}
+	}
+});
+
+test("Pi 1.5 host tool rows inject configured hints into both registered renderers", (t) => {
+	const host = JSON.parse(readFileSync(new URL("../package.json", import.meta.resolve("@earendil-works/pi-coding-agent")), "utf8"));
+	const [major, minor] = host.version.split(".").map(Number);
+	if (major < 1 || (major === 1 && minor < 5)) {
+		t.skip("injected render-context helpers require Pi 1.5+");
+		return;
+	}
+	const tools = registeredTools();
+	for (const [name, args] of [
+		["pwsh", { command: "host-call\n".repeat(10) }],
+		["pwsh_job", { action: "wait", pattern: "host-call|".repeat(80) }],
+	] as const) {
+		installExpandBinding("alt+x");
+		const tool = tools.get(name)!;
+		let callSeen = false;
+		let resultSeen = false;
+		const row = new ToolExecutionComponent(name, "host-hints", args, {}, {
+			renderCall(args: unknown, theme: Theme, ctx: PowerShellRenderContext) {
+				assert.equal(typeof ctx.keyHint, "function");
+				callSeen = true;
+				return (tool.renderCall as typeof renderPwshCall)(args as never, theme, ctx as never);
+			},
+			renderResult(value: AgentToolResult<unknown>, options: { expanded: boolean; isPartial: boolean }, theme: Theme, ctx: PowerShellRenderContext) {
+				assert.equal(typeof ctx.keyHint, "function");
+				resultSeen = true;
+				return (tool.renderResult as typeof renderPowerShellResult)(value, options, theme, ctx);
+			},
+		} as never, { requestRender() {} } as never, process.cwd());
+		row.updateResult({ ...result("host-output\n".repeat(10)), isError: false });
+		assert.ok(callSeen && resultSeen);
+		assert.equal(renderVisible(row, 80).join("\n").match(/alt\+x to expand/g)?.length, 2);
+		installExpandBinding("ctrl+y");
+		row.invalidate();
+		const refreshed = renderVisible(row, 80).join("\n");
+		assert.equal(refreshed.match(/ctrl\+y to expand/g)?.length, 2);
+		assert.doesNotMatch(refreshed, /alt\+x/);
+		row.setExpanded(true);
+		assert.doesNotMatch(renderVisible(row, 80).join("\n"), /to expand/);
+	}
 });
 
 test("recorded final duration survives restored state and invalidates cached rows", () => {
