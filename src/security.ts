@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawnSync, type SpawnSyncOptionsWithStringEncoding, type SpawnSyncReturns } from "node:child_process";
 import { existsSync } from "node:fs";
 import { win32 } from "node:path";
 
@@ -22,12 +22,23 @@ function unquote(value: string): string {
 	return trimmed.startsWith('"') && trimmed.endsWith('"') ? trimmed.slice(1, -1) : trimmed;
 }
 
+/** A rooted path like \tools still depends on the current drive. */
+function isDrivePath(value: string): boolean {
+	return /^[a-zA-Z]:[\\/]/.test(value);
+}
+
+/** Explicit network overrides need a server and share, not a device namespace. */
+function isUncPath(value: string): boolean {
+	const match = /^[\\/]{2}([^\\/]+)[\\/]([^\\/]+)(?:[\\/]|$)/.exec(value);
+	return Boolean(match && ![".", "..", "?"].includes(match[1]) && ![".", ".."].includes(match[2]));
+}
+
 function absoluteDirectories(value: string | undefined): string[] {
 	if (!value) return [];
 	return value
 		.split(win32.delimiter)
 		.map(unquote)
-		.filter((entry) => entry.length > 0 && win32.isAbsolute(entry))
+		.filter(isDrivePath)
 		.map((entry) => win32.normalize(entry));
 }
 
@@ -52,7 +63,7 @@ export function windowsDirectory(env: Environment = process.env): string {
 	for (const candidate of [env.SystemRoot, env.WINDIR]) {
 		if (!candidate) continue;
 		const directory = unquote(candidate);
-		if (win32.isAbsolute(directory)) return win32.normalize(directory);
+		if (isDrivePath(directory)) return win32.normalize(directory);
 	}
 	return String.raw`C:\Windows`;
 }
@@ -62,7 +73,7 @@ export function powerShellCandidates(env: Environment = process.env): string[] {
 	const explicitValue = env[POWERSHELL_RUNTIME_ENV]?.trim();
 	if (explicitValue) {
 		const explicit = unquote(explicitValue);
-		if (!win32.isAbsolute(explicit)) {
+		if (!isDrivePath(explicit) && !isUncPath(explicit)) {
 			throw new Error(`${POWERSHELL_RUNTIME_ENV} must be an absolute Windows path: ${explicitValue}`);
 		}
 		return [win32.normalize(explicit)];
@@ -73,24 +84,34 @@ export function powerShellCandidates(env: Environment = process.env): string[] {
 		[env.ProgramW6432, env.ProgramFiles, env["ProgramFiles(x86)"]]
 			.filter((entry): entry is string => Boolean(entry))
 			.map(unquote)
-			.filter((entry) => win32.isAbsolute(entry)),
+			.filter(isDrivePath),
 	);
 	const systemRoot = windowsDirectory(env);
+	const localRoot = unquote(env.LOCALAPPDATA ?? "");
 
 	return unique([
 		...programRoots.map((root) => win32.join(root, "PowerShell", "7", "pwsh.exe")),
 		...pathDirectories.map((directory) => win32.join(directory, "pwsh.exe")),
+		...(isDrivePath(localRoot) ? [win32.join(localRoot, "Microsoft", "WindowsApps", "pwsh.exe")] : []),
 		win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
 		...pathDirectories.map((directory) => win32.join(directory, "powershell.exe")),
 	]);
 }
 
-export function probePowerShellRuntime(executable: string, env: Environment = process.env): PowerShellRuntime | undefined {
-	if (!win32.isAbsolute(executable)) return undefined;
+type ProbeProcess = (executable: string, args: string[], options: SpawnSyncOptionsWithStringEncoding) => SpawnSyncReturns<string>;
+
+export function probePowerShellRuntime(
+	executable: string,
+	env: Environment = process.env,
+	run: ProbeProcess = spawnSync,
+): PowerShellRuntime | undefined {
+	if (!isDrivePath(executable) && !isUncPath(executable)) return undefined;
 	const script =
 		"[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); " +
 		"Write-Output ($PSVersionTable.PSEdition + '|' + $PSVersionTable.PSVersion.Major + '|' + $PSVersionTable.PSVersion.ToString())";
-	const result = spawnSync(executable, ["-NoProfile", "-NonInteractive", "-Command", script], {
+	const result = run(executable, ["-NoProfile", "-NonInteractive", "-Command", script], {
+		// Keep the project directory out of the probe's DLL search path.
+		cwd: win32.dirname(executable),
 		encoding: "utf8",
 		env,
 		timeout: PROBE_TIMEOUT_MS,
@@ -115,11 +136,11 @@ export function probePowerShellRuntime(executable: string, env: Environment = pr
 /** Resolve and probe a supported runtime without unqualified discovery commands. */
 export function findPowerShellRuntime(
 	env: Environment = process.env,
-	fileExists: FileExists = existsSync,
 	probe: RuntimeProbe = probePowerShellRuntime,
 ): PowerShellRuntime {
 	for (const candidate of powerShellCandidates(env)) {
-		if (!fileExists(candidate)) continue;
+		// Store App Execution Aliases can launch even when existsSync reports false.
+		// A failed/missing candidate is rejected by the bounded probe itself.
 		const runtime = probe(candidate, env);
 		if (runtime) return runtime;
 	}

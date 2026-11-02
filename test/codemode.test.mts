@@ -347,3 +347,47 @@ test("Pi 1.2: background notification during before_agent_start queues into the 
 		assert.doesNotMatch(JSON.stringify(notices), /PRIVATE_START_OUTPUT|Write-Output/);
 	} finally { await h.close(); }
 });
+
+// Adapt upstream's real-session regressions using this suite's version-isolated host loader.
+test("real session: idle notifications omit output until the model explicitly reads it", { skip: !enabled, timeout: 15000 }, async () => {
+	const h = await setup();
+	const call = (name: string, args: Record<string, unknown>) => h.ai.fauxAssistantMessage([h.ai.fauxToolCall(name, args)], { stopReason: "toolUse" });
+	try {
+		h.faux.setResponses([
+			call("pwsh", { command: "Start-Sleep -Seconds 2; Write-Output ('OUTPUT_' + 'SENTINEL')", run_in_background: true }),
+			h.ai.fauxAssistantMessage("started"),
+			call("pwsh_job", { action: "output", id: "bg-1" }),
+			h.ai.fauxAssistantMessage("done"),
+		]);
+		await h.session.prompt("start the job");
+		assert.equal(h.requests.length, 2);
+		await waitUntil(() => h.requests.length >= 4 && h.session.isIdle);
+		assert.equal(h.requests.length, 4);
+		const woken = JSON.stringify(h.requests[2]);
+		assert.match(woken, /background-job-finished/);
+		assert.doesNotMatch(woken, /OUTPUT_SENTINEL/);
+		const stored = h.session.messages.filter((m: any) => m.customType === "pwsh-bg-notify");
+		assert.equal(stored.length, 1);
+		assert.doesNotMatch(JSON.stringify(stored), /OUTPUT_SENTINEL/);
+		const output = h.session.messages.findLast((m: any) => m.role === "toolResult" && m.toolName === "pwsh_job");
+		assert.match(textOf(output), /OUTPUT_SENTINEL/);
+	} finally { await h.close(); }
+});
+
+test("real session: a completion steers into an active tool run without a competing turn", { skip: !enabled, timeout: 15000 }, async () => {
+	const h = await setup();
+	const call = (name: string, args: Record<string, unknown>) => h.ai.fauxAssistantMessage([h.ai.fauxToolCall(name, args)], { stopReason: "toolUse" });
+	try {
+		h.faux.setResponses([
+			call("pwsh", { command: "Write-Output ('ACTIVE_' + 'PRIVATE_OUTPUT')", run_in_background: true }),
+			call("pwsh", { command: "Start-Sleep -Seconds 3" }),
+			h.ai.fauxAssistantMessage("done"),
+		]);
+		await h.session.prompt("work while the job completes");
+		assert.equal(h.requests.length, 3);
+		const steered = JSON.stringify(h.requests[2]);
+		assert.match(steered, /background-job-finished/);
+		assert.doesNotMatch(steered, /ACTIVE_PRIVATE_OUTPUT/);
+		assert.equal(h.events.filter(e => e.type === "agent_start").length, 1);
+	} finally { await h.close(); }
+});

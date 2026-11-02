@@ -1,6 +1,6 @@
 # pi-pwsh-notify-secure
 
-Security-hardened fork of [oversk7/pi-pwsh-notify](https://github.com/oversk7/pi-pwsh-notify). Release `0.5.0-secure.7` selectively adapts upstream 0.5.0 reliability work without adopting its weaker executable resolution, execution-policy override, automatic output disclosure, or default complete-output logs.
+Security-hardened fork of [oversk7/pi-pwsh-notify](https://github.com/oversk7/pi-pwsh-notify). The development tree selectively tracks upstream **0.6.0**; the published and installed tag remains `0.5.0-secure.7` until a separately approved release. Upstream 0.6.0 now shares absolute executable resolution and metadata-only notifications. This fork retains its no-policy-bypass and no-default-complete-log policies, older-host compatibility, and structured results.
 
 English | [中文说明](#中文说明)
 
@@ -17,7 +17,7 @@ Pi 0.84.3 introduced an optional native `powershell` tool for ordinary foregroun
 1. Native Pi has no managed background jobs, persistent `cd`, blocking job wait, or ready/finished steering notifications.
 2. The native implementation examined at Pi 0.84.3 used unqualified executable discovery and cleanup helpers; this fork uses verified absolute executable paths and does not force `-ExecutionPolicy Bypass`.
 
-The peer floor remains Pi/TUI 0.84.3. The isolated Windows compatibility matrix targets Pi/TUI 0.84.3, 0.87.1, 0.99.1, 1.1.0, 1.2.0, and 1.5.0; the locked development dependency baseline is Pi/TUI 1.5.0. Pi 0.99 adds structured codemode results without requiring a host upgrade for ordinary tool use. See the [source-by-source Pi comparison](docs/research/pi-0.84.3-native-powershell.md), the [upstream 0.5.0 secure-adaptation matrix](docs/research/upstream-0.5.0-secure-adaptation.md), and the [upstream synchronization checklist](docs/maintenance/upstream-sync.md).
+The peer floor remains Pi/TUI 0.84.3. The isolated Windows compatibility matrix targets Pi/TUI 0.84.3, 0.87.1, 0.99.1, 1.1.0, 1.2.0, and 1.5.0; the locked development dependency baseline is Pi/TUI 1.5.0. Pi 0.99 adds structured codemode results without requiring a host upgrade for ordinary tool use. See the [source-by-source Pi comparison](docs/research/pi-0.84.3-native-powershell.md), the [upstream 0.5.0 secure-adaptation matrix](docs/research/upstream-0.5.0-secure-adaptation.md), the [upstream 0.6.0 review](docs/research/upstream-0.6.0-secure-adaptation.md), and the [upstream synchronization checklist](docs/maintenance/upstream-sync.md).
 
 ### Symptoms this fixes
 
@@ -112,9 +112,15 @@ Foreground, background, and `!`/`!!` execution share the same process lifecycle,
 
 All timeouts are **seconds**, including the `BashOperations` adapter. Omitted timeouts mean 120 seconds for foreground `pwsh` and `pwsh_job wait`, unlimited for background and user-shell operations. Explicit `0` means unlimited. Negative, nonfinite, and values above `2147483.647` seconds are rejected before launch/wait; positive sub-millisecond values round up to 1ms. A wait timeout does not stop the job.
 
-When a shell exits but a descendant holds stdout/stderr open, capture settles after **250ms of pipe inactivity**, restarting that grace period on every output chunk. Normal EOF finishes immediately. Explicit results warn if capture ended with open pipes; late output after that boundary may be lost. A managed job represents the original shell, not every independently detached descendant. Keep servers in the foreground of the managed shell rather than daemonizing them. Continuous post-exit output keeps capture active, but an explicit execution timeout or cancellation still stops capture. After the parent exits, stopping capture cannot guarantee termination of independently detached descendants; it does not target the now-stale parent PID.
+When a shell exits but a descendant holds stdout/stderr open, capture settles after **250ms of pipe inactivity**, restarting that grace period on every output chunk. Normal EOF finishes immediately. Explicit results warn if capture ended with open pipes; late output after that boundary is discarded. Still-open pipes are drained without retaining output and unreferenced so surviving descendants do not receive broken-pipe errors and cannot keep Pi alive merely by holding the handles. A managed job represents the original shell, not every independently detached descendant. Keep servers in the foreground of the managed shell rather than daemonizing them. Continuous post-exit output keeps capture active, but an explicit execution timeout or cancellation still stops capture. After the parent exits, stopping capture cannot guarantee termination of independently detached descendants; it does not target the now-stale parent PID.
 
 The shared runner never writes output logs. **Pi itself owns the `!`/`!!` output consumer** and Pi 0.87.1 may spill large user-shell output to temporary `pi-bash-*.log` files. Use `pwsh`/`pwsh_job` when the extension's no-complete-output-log behavior is required. Pi 0.99's codemode consumer can also spill oversized **printed script output** to disk, and `store()` persists values in the session. This extension cannot promise log-free behavior for host consumers or caller scripts. Normal Pi conversation persistence still applies to returned tool output.
+
+## Executable resolution
+
+PowerShell candidates must be fully qualified before any probe: `C:\...` or an explicit `\\server\share\...` override. Paths such as `\tools`, `/tools`, `C:tools`, incomplete UNC paths, and device namespaces are rejected. Implicit PATH, Program Files, LOCALAPPDATA, and Windows-directory discovery accept only drive-qualified directories; UNC locations require a deliberate `PI_PWSH_NOTIFY_EXECUTABLE` override rather than automatic probing that may send credentials to a share.
+
+Candidates are probed directly with a bounded timeout, not prefiltered through `existsSync()`: Windows Store App Execution Aliases may launch even when that check returns false. The LOCALAPPDATA Store alias is tried before the Windows PowerShell fallback. Probe and cleanup subprocesses use their executable directory as cwd, not the project directory. Absolute resolution prevents ambiguous name lookup; it does not authenticate a binary or replace filesystem permissions. The fork still does not force `-ExecutionPolicy Bypass`.
 
 ## Built-in tool handling
 

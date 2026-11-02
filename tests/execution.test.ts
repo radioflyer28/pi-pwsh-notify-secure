@@ -102,6 +102,37 @@ test("quiet inherited handles settle after exit without requiring close", async 
   assert.equal(proc.stdout.listenerCount("data"), 0);
 });
 
+test("settlement detaches and drains inherited pipes without breaking a surviving writer", async () => {
+  const { proc, execution } = fake();
+  proc.stdout.write("retained");
+  proc.emit("exit", 0, null);
+  assert.equal((await execution.done).outputIncomplete, true);
+  assert.equal(proc.stdout.destroyed, false);
+  assert.equal(proc.stderr.destroyed, false);
+  const write = (stream: PassThrough) => new Promise<void>((resolve, reject) => {
+    stream.write("late discarded output", error => error ? reject(error) : resolve());
+  });
+  await Promise.all([write(proc.stdout), write(proc.stderr)]);
+  assert.equal(execution.output.text, "retained", "detached output is not retained or forwarded");
+  assert.equal(proc.stdout.readableFlowing, true);
+  proc.stdout.end(); proc.stderr.end();
+});
+
+test("idle settlement rechecks activity after queued pipe output gets an event-loop pass", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { proc, execution } = fake();
+  let settled = false;
+  void execution.done.then(() => { settled = true; });
+  proc.emit("exit", 0, null);
+  t.mock.timers.tick(EXIT_IDLE_MS);
+  proc.stdout.write("queued during the idle boundary");
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(settled, false);
+  proc.stdout.end(); proc.stderr.end();
+  assert.equal((await execution.done).outputIncomplete, false);
+  assert.equal(execution.output.text, "queued during the idle boundary");
+});
+
 test("late output re-arms post-exit idle grace instead of losing an active tail", async () => {
   const { proc, execution } = fake();
   let done = false;

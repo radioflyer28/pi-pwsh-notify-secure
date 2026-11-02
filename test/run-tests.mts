@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import { readdir } from "node:fs/promises";
-import { realpathSync } from "node:fs";
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { lstatSync, realpathSync } from "node:fs";
+import { join, win32 } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -214,6 +215,19 @@ async function runRuntime(command: string): Promise<{ output: string; code: numb
 }
 
 // Real-process coverage is explicitly Windows-only.
+test("runtime: an installed Store App Execution Alias is probed directly", { skip: process.platform !== "win32" }, (t) => {
+  if (!process.env.LOCALAPPDATA) return t.skip("LOCALAPPDATA is not configured");
+  const alias = win32.join(process.env.LOCALAPPDATA, "Microsoft", "WindowsApps", "pwsh.exe");
+  try { lstatSync(alias); }
+  catch (error) {
+    if (["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) return t.skip("no Store PowerShell alias is installed");
+    throw error;
+  }
+  const runtime = resolvePowerShellRuntime({ ...process.env, PI_PWSH_NOTIFY_EXECUTABLE: alias });
+  assert.equal(runtime.executable.toLowerCase(), alias.toLowerCase());
+  assert.equal(runtime.kind, "pwsh");
+});
+
 test("cwd assertions compare canonical paths across Windows short-name aliases", { skip: process.platform !== "win32" }, async (t) => {
   const harness = makeHarness();
   harness.fire("session_start");
@@ -738,8 +752,8 @@ test("user shell streams before completion, strips cwd records, and shares the f
   await harness.emit("session_shutdown");
 });
 
-function inheritedPipeCommand(quiet: boolean): string {
-  const childCode = quiet
+function inheritedPipeCommand(quiet: boolean | string): string {
+  const childCode = typeof quiet === "string" ? quiet : quiet
     ? "setTimeout(() => process.exit(0), 2500)"
     : "let n=0; const t=setInterval(() => { console.log('LATE_'+n); if (++n===10) {clearInterval(t); console.log('DESCENDANT_FINAL');} }, 80)";
   const parentCode = `const {spawn}=require('node:child_process'); const c=spawn(process.execPath,['-e',${JSON.stringify(childCode)}],{stdio:['ignore','inherit','inherit'],detached:true}); c.unref(); console.log('PARENT_DONE');`;
@@ -785,6 +799,44 @@ test("inherited pipes: quiet descendant cannot hold foreground, background wait 
       t.diagnostic(`${mode}: settled in ${elapsed}ms`);
     } finally { await harness.emit("session_shutdown"); }
   }
+});
+
+test("inherited pipes: a detached descendant survives writing after capture stops", { skip: process.platform !== "win32" }, async () => {
+  const harness = makeHarness();
+  const dir = await mkdtemp(join(tmpdir(), "pwsh-survivor-"));
+  const report = join(dir, "report.txt");
+  const child = `let broken=false;process.stdout.on('error',()=>{broken=true});process.stderr.on('error',()=>{broken=true});setTimeout(()=>{process.stdout.write('late stdout\\n');process.stderr.write('late stderr\\n');setTimeout(()=>{require('node:fs').writeFileSync(${JSON.stringify(report)},broken?'broken':'alive')},200)},1500)`;
+  try {
+    const result = await harness.call("pwsh", { command: inheritedPipeCommand(child) });
+    assert.equal(result.details.outputIncomplete, true);
+    const deadline = Date.now() + 10_000;
+    let status = "";
+    while (!status && Date.now() < deadline) {
+      try { status = await readFile(report, "utf8"); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+      if (!status) await sleep(50);
+    }
+    assert.equal(status, "alive", "closing a survivor's stdout/stderr must not cause EPIPE");
+    assert.doesNotMatch(textOf(result), /late stdout|late stderr/);
+  } finally {
+    await harness.emit("session_shutdown");
+    await sleep(1800); // The finite child must finish before its temporary report directory is removed.
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Unicode survives PowerShell, native argv/output, and background capture", { skip: process.platform !== "win32" }, async () => {
+  const harness = makeHarness();
+  const text = "中文 日本語 한국어 ✓ 😀";
+  const native = "require('node:fs').writeSync(1,process.argv[1]+'\\n')";
+  const command = `Write-Output '${text}'; & '${process.execPath.replaceAll("'", "''")}' -e '${native.replaceAll("'", "''")}' '${text}'`;
+  try {
+    const foreground = textOf(await harness.call("pwsh", { command }));
+    assert.equal(foreground.split("\n").filter(line => line === text).length, 2, foreground);
+    await harness.call("pwsh", { command, run_in_background: true });
+    const background = textOf(await harness.call("pwsh_job", { action: "wait", id: "bg-1", timeout: 10 }));
+    assert.equal(background.split("\n").filter(line => line === text).length, 2, background);
+  } finally { await harness.emit("session_shutdown"); }
 });
 
 test("user-shell stress: 16 MiB streams to the caller without buffering the complete transcript", { skip: process.platform !== "win32" }, async (t) => {

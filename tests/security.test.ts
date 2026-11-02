@@ -5,7 +5,9 @@ import { AUTOMATED_NOTE, jobNotificationMetadata } from "../src/notifications.ts
 import {
 	findPowerShellRuntime,
 	powerShellCandidates,
+	probePowerShellRuntime,
 	taskkillExecutable,
+	windowsDirectory,
 } from "../src/security.ts";
 import { activeToolsForPowerShell, activeToolsWithPwsh } from "../src/tool-selection.ts";
 
@@ -13,86 +15,95 @@ test("PowerShell resolution ignores cwd-relative and empty PATH entries", () => 
 	const attempted: string[] = [];
 	const expected = String.raw`C:\Tools\PowerShell\pwsh.exe`;
 	const resolved = findPowerShellRuntime(
-		{
-			Path: String.raw`;.;relative\bin;C:\Tools\PowerShell`,
-			SystemRoot: String.raw`C:\Windows`,
+		{ Path: String.raw`;.;relative\bin;\rooted;C:drive-relative;\\server\share;C:\Tools\PowerShell`, SystemRoot: String.raw`C:\Windows` },
+		(executable) => {
+			attempted.push(executable);
+			return executable === expected ? { executable, version: "7.5.0", edition: "Core", kind: "pwsh" } : undefined;
 		},
-		(candidate) => {
-			attempted.push(candidate);
-			return candidate === expected;
-		},
-		(executable) => ({ executable, version: "7.5.0", edition: "Core", kind: "pwsh" }),
 	);
-
 	assert.equal(resolved.executable, expected);
-	assert.ok(attempted.every((candidate) => win32.isAbsolute(candidate)));
-	assert.ok(attempted.every((candidate) => !candidate.includes("relative")));
+	assert.deepEqual(attempted, [expected]);
 });
 
 test("PowerShell 7 is preferred over Windows PowerShell", () => {
 	const pwsh = String.raw`C:\Program Files\PowerShell\7\pwsh.exe`;
-	const windowsPowerShell = String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`;
 	const resolved = findPowerShellRuntime(
-		{
-			ProgramFiles: String.raw`C:\Program Files`,
-			SystemRoot: String.raw`C:\Windows`,
-		},
-		(candidate) => candidate === pwsh || candidate === windowsPowerShell,
-		(executable) =>
-			executable === pwsh
-				? { executable, version: "7.5.0", edition: "Core", kind: "pwsh" }
-				: { executable, version: "5.1", edition: "Desktop", kind: "windows-powershell" },
+		{ ProgramFiles: String.raw`C:\Program Files`, SystemRoot: String.raw`C:\Windows` },
+		(executable) => executable === pwsh
+			? { executable, version: "7.5.0", edition: "Core", kind: "pwsh" }
+			: { executable, version: "5.1", edition: "Desktop", kind: "windows-powershell" },
 	);
-
 	assert.equal(resolved.executable, pwsh);
 });
 
-test("runtime metadata is returned only after probing an absolute candidate", () => {
-	const expected = String.raw`C:\Tools\PowerShell\pwsh.exe`;
-	const runtime = findPowerShellRuntime(
-		{ Path: String.raw`.;;relative\bin;C:\Tools\PowerShell` },
-		(candidate) => candidate === expected,
-		(executable) => ({ executable, version: "7.5.0", edition: "Core", kind: "pwsh" }),
-	);
-	assert.deepEqual(runtime, { executable: expected, version: "7.5.0", edition: "Core", kind: "pwsh" });
-});
-
-test("validated Windows PowerShell remains the fallback when PowerShell 7 is absent", () => {
-	const windowsPowerShell = String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`;
-	const runtime = findPowerShellRuntime(
-		{ SystemRoot: String.raw`C:\Windows` },
-		(candidate) => candidate === windowsPowerShell,
-		(executable) => ({ executable, version: "5.1.22621.4391", edition: "Desktop", kind: "windows-powershell" }),
-	);
-	assert.equal(runtime.executable, windowsPowerShell);
-	assert.equal(runtime.kind, "windows-powershell");
-});
-
-test("relative executable overrides are rejected instead of resolved from cwd", () => {
-	assert.throws(
-		() => powerShellCandidates({ PI_PWSH_NOTIFY_EXECUTABLE: String.raw`.\pwsh.exe` }),
-		/must be an absolute Windows path/,
-	);
-});
-
-test("candidate enumeration never invokes or returns an unqualified discovery command", () => {
-	const candidates = powerShellCandidates({
-		Path: String.raw`;.;relative\bin;C:\Tools\PowerShell`,
-		ProgramFiles: String.raw`C:\Program Files`,
-		SystemRoot: String.raw`C:\Windows`,
+test("a Store alias reaches the probe without a filesystem existence gate", () => {
+	const alias = String.raw`C:\StoreOnly\Microsoft\WindowsApps\pwsh.exe`;
+	const env = { LOCALAPPDATA: String.raw`C:\StoreOnly`, SystemRoot: String.raw`C:\Windows` };
+	const probed: string[] = [];
+	const resolved = findPowerShellRuntime(env, (executable, actualEnv) => {
+		assert.equal(actualEnv, env);
+		probed.push(executable);
+		return executable === alias ? { executable, version: "7.5.0", edition: "Core", kind: "pwsh" } : undefined;
 	});
-	assert.ok(candidates.length > 0);
-	assert.ok(candidates.every((candidate) => win32.isAbsolute(candidate)));
-	assert.ok(candidates.every((candidate) => !/where\.exe$/i.test(candidate)));
-	assert.ok(candidates.every((candidate) => !candidate.includes("relative")));
+	assert.equal(resolved.executable, alias);
+	assert.deepEqual(probed, [alias]);
+	assert.equal(findPowerShellRuntime({ PI_PWSH_NOTIFY_EXECUTABLE: alias }, () => resolved), resolved);
+});
+
+test("a missing or unsupported candidate cannot prevent the Windows PowerShell fallback", () => {
+	const expected = String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`;
+	const probed: string[] = [];
+	const runtime = findPowerShellRuntime({ ProgramFiles: String.raw`C:\Missing` }, (executable) => {
+		probed.push(executable);
+		return executable === expected ? { executable, version: "5.1", edition: "Desktop", kind: "windows-powershell" } : undefined;
+	});
+	assert.equal(runtime.executable, expected);
+	assert.deepEqual(probed, [String.raw`C:\Missing\PowerShell\7\pwsh.exe`, expected]);
+	assert.throws(() => findPowerShellRuntime({ PI_PWSH_NOTIFY_EXECUTABLE: String.raw`C:\Missing\pwsh.exe` }, () => undefined), /unavailable or unsupported/);
+});
+
+test("overrides require a full drive or UNC path, not a current-drive root or device namespace", () => {
+	for (const value of ["pwsh.exe", String.raw`.\pwsh.exe`, String.raw`\tools\pwsh.exe`, "/tools/pwsh.exe", "C:pwsh.exe", '""', String.raw`\\server`, String.raw`\\.\pipe\pwsh`, String.raw`\\?\C:\pwsh.exe`]) {
+		assert.throws(() => powerShellCandidates({ PI_PWSH_NOTIFY_EXECUTABLE: value }), /must be an absolute Windows path/, value);
+		let launches = 0;
+		assert.equal(probePowerShellRuntime(value, {}, () => { launches++; throw new Error("must not launch"); }), undefined);
+		assert.equal(launches, 0);
+	}
+	for (const value of [String.raw`C:\Tools\pwsh.exe`, "D:/Tools/pwsh.exe", String.raw`\\server\share\pwsh.exe`, "//server/share/pwsh.exe"]) {
+		assert.deepEqual(powerShellCandidates({ PI_PWSH_NOTIFY_EXECUTABLE: value }), [win32.normalize(value)]);
+	}
+});
+
+test("implicit discovery is local-drive-only and deduplicates quoted Store PATH entries", () => {
+	const candidates = powerShellCandidates({
+		Path: String.raw`;.;relative\bin;\tools;/tools;C:tools;\\server\share;"C:\Local\Microsoft\WindowsApps"`,
+		ProgramFiles: String.raw`\rooted`, ProgramW6432: String.raw`\\server\share`,
+		LOCALAPPDATA: String.raw`C:\Local`, SystemRoot: String.raw`\Windows`, WINDIR: String.raw`D:\Windows`,
+	});
+	assert.deepEqual(candidates, [String.raw`C:\Local\Microsoft\WindowsApps\pwsh.exe`, String.raw`D:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`, String.raw`C:\Local\Microsoft\WindowsApps\powershell.exe`]);
+	assert.ok(candidates.every(path => /^[a-z]:[\\/]/i.test(path)));
+	assert.equal(windowsDirectory({ SystemRoot: String.raw`\Windows`, WINDIR: "C:Windows" }), String.raw`C:\Windows`);
+	assert.equal(taskkillExecutable({ SystemRoot: String.raw`\Windows`, WINDIR: String.raw`D:\Windows` }, () => true), String.raw`D:\Windows\System32\taskkill.exe`);
+});
+
+test("the bounded probe uses the executable directory and preserves the no-Bypass policy", () => {
+	const executable = String.raw`C:\Trusted\pwsh.exe`;
+	const env = { Path: String.raw`C:\Trusted` };
+	const runtime = probePowerShellRuntime(executable, env, (file, args, options) => {
+		assert.equal(file, executable);
+		assert.equal(options.cwd, String.raw`C:\Trusted`);
+		assert.equal(options.env, env);
+		assert.equal(options.timeout, 5000);
+		assert.equal(options.windowsHide, true);
+		assert.doesNotMatch(args.join(" "), /ExecutionPolicy|Bypass/);
+		return { pid: 1, status: 0, signal: null, stdout: "Core|7|7.5.0\n", stderr: "", output: [null, "Core|7|7.5.0\n", ""] };
+	});
+	assert.deepEqual(runtime, { executable, version: "7.5.0", edition: "Core", kind: "pwsh" });
 });
 
 test("taskkill is resolved only from System32", () => {
 	const expected = String.raw`D:\Windows\System32\taskkill.exe`;
-	assert.equal(
-		taskkillExecutable({ SystemRoot: String.raw`D:\Windows`, Path: String.raw`. ; C:\malicious` }, (p) => p === expected),
-		expected,
-	);
+	assert.equal(taskkillExecutable({ SystemRoot: String.raw`D:\Windows`, Path: String.raw`. ; C:\malicious` }, (p) => p === expected), expected);
 });
 
 test("automatic notifications contain metadata but no command or process output", () => {

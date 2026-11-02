@@ -2,8 +2,8 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
-const baseline = "v0.5.0";
-const baselineCommit = "4a7a48a03e3db3a6d7da901c5d0db1668560be85";
+const baseline = "v0.6.0";
+const baselineCommit = "cb5673b416e172d3410100f363e2b004d4725001";
 
 function git(...args) {
 	const result = spawnSync("git", args, { cwd: root, encoding: "utf8" });

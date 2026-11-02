@@ -1,4 +1,5 @@
 import type { ChildProcess } from "node:child_process";
+import type { Socket } from "node:net";
 import { randomUUID } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
 import { buildPowerShellScript, killProcessTree, spawnPowerShell } from "./runtime.js";
@@ -163,6 +164,7 @@ export function startExecution(options: ExecutionOptions, operations: ExecutionO
 	const done = new Promise<ExecutionOutcome>((resolve) => {
 		let settled = false;
 		let exited = false;
+		let activity = 0;
 		let timeout: NodeJS.Timeout | undefined;
 		let idle: NodeJS.Timeout | undefined;
 		const emit = (text: string) => {
@@ -185,6 +187,7 @@ export function startExecution(options: ExecutionOptions, operations: ExecutionO
 			};
 			const data = (chunk: Buffer) => {
 				if (settled) return;
+				activity++;
 				decoded(decoder.write(chunk));
 				if (exited) armIdle();
 			};
@@ -201,7 +204,13 @@ export function startExecution(options: ExecutionOptions, operations: ExecutionO
 				stream?.removeListener("data", data);
 				stream?.removeListener("end", end);
 				stream?.removeListener("close", end);
-				stream?.destroy();
+				if (stream && !stream.readableEnded && !stream.destroyed) {
+					// Closing inherited pipes can crash a surviving daemon on its next write.
+					// Drain without retaining/forwarding output, and do not keep Pi alive.
+					stream.on("error", () => {});
+					stream.resume();
+					(stream as Socket).unref?.();
+				}
 			} };
 		});
 		function finish() {
@@ -224,8 +233,14 @@ export function startExecution(options: ExecutionOptions, operations: ExecutionO
 		function armIdle() {
 			if (idle) clearTimeout(idle);
 			idle = setTimeout(() => {
-				state.outputIncomplete = streams.some((stream) => !stream.ended());
-				finish();
+				// Let the poll phase deliver queued output before declaring the pipes idle.
+				const seen = activity;
+				setImmediate(() => {
+					if (settled) return;
+					if (activity !== seen) { armIdle(); return; }
+					state.outputIncomplete = streams.some((stream) => !stream.ended());
+					finish();
+				});
 			}, EXIT_IDLE_MS);
 		}
 		function terminate() {

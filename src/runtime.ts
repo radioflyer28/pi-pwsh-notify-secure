@@ -1,4 +1,5 @@
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
+import { win32 } from "node:path";
 import { findPowerShellRuntime, taskkillExecutable, type PowerShellRuntime } from "./security.js";
 
 export interface SpawnPowerShellOptions {
@@ -83,6 +84,7 @@ function isProcessRunning(pid: number): boolean {
 export function killProcessTree(pid: number, env: NodeJS.ProcessEnv = process.env): void {
 	const executable = taskkillExecutable(env);
 	const result = spawnSync(executable, ["/PID", String(pid), "/T", "/F"], {
+		cwd: win32.dirname(executable),
 		encoding: "utf8",
 		windowsHide: true,
 		timeout: 2_000,

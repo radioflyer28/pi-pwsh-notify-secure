@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
-import { initTheme } from "@earendil-works/pi-coding-agent";
+import { initTheme, wrapRegisteredTool } from "@earendil-works/pi-coding-agent";
 import { KeybindingsManager, setKeybindings, visibleWidth } from "@earendil-works/pi-tui";
 
 initTheme();
@@ -47,8 +47,26 @@ extension(pi);
 const emit = async (event: string) => {
 	for (const handler of handlers.get(event) ?? []) await handler({ type: event }, ctx);
 };
-const call = (name: string, params: Record<string, unknown>, onUpdate?: (result: any) => void) =>
-	tools.get(name).execute("manual", params, undefined, onUpdate, ctx);
+let callSequence = 0;
+const call = async (name: string, params: Record<string, unknown>, onUpdate?: (result: any) => void) => {
+	const id = `manual-${++callSequence}`;
+	const contextFactory = { createContext: () => ctx, createToolContext: () => ctx, getActiveTools: () => [...activeTools] };
+	const wrapped = wrapRegisteredTool({ definition: tools.get(name) } as any,
+		contextFactory as unknown as Parameters<typeof wrapRegisteredTool>[1]);
+	let result: any;
+	let isError = false;
+	try { result = await wrapped.execute(id, params, undefined, onUpdate); }
+	catch (error) {
+		isError = true;
+		result = { content: [{ type: "text", text: (error as Error).message }], details: undefined };
+	}
+	// Match AgentSession's error handling and tool_result enrichment, not raw execute().
+	for (const handler of handlers.get("tool_result") ?? []) {
+		const change = await handler({ type: "tool_result", toolName: name, toolCallId: id, input: params, ...result, isError }, ctx);
+		if (change) result = { ...result, ...change };
+	}
+	return { ...result, isError };
+};
 const textOf = (result: any) => result.content[0].text as string;
 const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
 const renderContext = (args: Record<string, unknown>, expanded: boolean, overrides: Record<string, unknown> = {}) => ({
@@ -75,6 +93,7 @@ const assertRendered = (component: any, width: number, expected: RegExp) => {
 await emit("session_start");
 const foregroundArgs = { command: "Write-Output FOREGROUND_EXPLICIT" };
 const foregroundResult = await call("pwsh", foregroundArgs);
+assert.equal(foregroundResult.isError, false);
 const foreground = textOf(foregroundResult);
 assert.match(foreground, /FOREGROUND_EXPLICIT/);
 
@@ -86,6 +105,8 @@ assert.match(textOf(streamingResult), /STREAM_ONE[\s\S]*STREAM_TWO/);
 
 const failureArgs = { command: "Write-Error FAILURE_EXPLICIT; exit 3" };
 const failureResult = await call("pwsh", failureArgs);
+assert.equal(failureResult.isError, true);
+assert.equal(failureResult.structuredContent.execution.exit_code, 3);
 assert.match(textOf(failureResult), /FAILURE_EXPLICIT/);
 assert.match(textOf(failureResult), /exit code: 3/);
 
@@ -142,8 +163,13 @@ const listed = textOf(await call("pwsh_job", { action: "list" }));
 assert.match(listed, /bg-3/);
 const output = textOf(await call("pwsh_job", { action: "output", id: "bg-3", lines: 10 }));
 assert.match(output, /OUTPUT_ACTION/);
-const killed = textOf(await call("pwsh_job", { action: "kill", id: "bg-3" }));
-assert.match(killed, /Killed bg-3/);
+const stopped = await call("pwsh_job", { action: "kill", id: "bg-3" });
+assert.equal(stopped.isError, false);
+assert.equal(stopped.structuredContent.stop_outcome, "termination_requested");
+const killed = textOf(stopped);
+assert.match(killed, /termination requested/);
+const stoppedWait = await call("pwsh_job", { action: "wait", id: "bg-3", timeout: 5 });
+assert.equal(stoppedWait.structuredContent.job.running, false);
 
 const actionArgs = [
 	{ action: "list" },
