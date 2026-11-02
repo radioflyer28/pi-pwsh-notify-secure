@@ -60,9 +60,14 @@ test("the development lock pins Pi 1.5 and patched Undici and minimatch releases
 	}
 });
 
-test("release metadata and installation instructions use 0.5.0-secure.7", () => {
-	assert.equal(packageJson.version, "0.5.0-secure.7");
-	assert.match(readme, /pi-pwsh-notify-secure@v0\.5\.0-secure\.7/);
+test("release metadata, lock roots, and installation instructions use 0.6.0-secure.1", async () => {
+	assert.equal(packageJson.version, "0.6.0-secure.1");
+	const lock = JSON.parse(await readFile(new URL("../package-lock.json", import.meta.url), "utf8"));
+	assert.equal(lock.version, packageJson.version);
+	assert.equal(lock.packages[""].version, packageJson.version);
+	const installTags = [...readme.matchAll(/pi install git:github\.com\/radioflyer28\/pi-pwsh-notify-secure@(\S+)/g)].map(match => match[1]);
+	assert.equal(installTags.length, 2, "English and Chinese install instructions must identify the release");
+	assert.ok(installTags.every(tag => tag === `v${packageJson.version}`));
 });
 
 test("documentation records the secure upstream adaptation and compatibility behavior", () => {

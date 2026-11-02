@@ -2,7 +2,7 @@
 
 ## Reviewed baseline and drift check
 
-The reviewed upstream baseline is [`v0.6.0`](https://github.com/oversk7/pi-pwsh-notify/releases/tag/v0.6.0), commit `cb5673b416e172d3410100f363e2b004d4725001`. The fork is **semantically synchronized by selective adaptation**, not ancestry-merged from that tag. The [0.6.0 adaptation matrix](../research/upstream-0.6.0-secure-adaptation.md) accounts for all six incoming commits and ten changed files; the [0.5.0 matrix](../research/upstream-0.5.0-secure-adaptation.md) remains historical evidence. This baseline does not change the published or installed `v0.5.0-secure.7` tag.
+The reviewed upstream baseline is [`v0.6.0`](https://github.com/oversk7/pi-pwsh-notify/releases/tag/v0.6.0), commit `cb5673b416e172d3410100f363e2b004d4725001`. The fork is **semantically synchronized by selective adaptation**, not ancestry-merged from that tag. The [0.6.0 adaptation matrix](../research/upstream-0.6.0-secure-adaptation.md) accounts for all six incoming commits and ten changed files; the [0.5.0 matrix](../research/upstream-0.5.0-secure-adaptation.md) remains historical evidence. Advancing this reviewed baseline alone neither creates a release tag nor changes existing installations; see the README for the current release install ref.
 
 Prefer upstream-compatible behavior and small ports; diverge only for a documented policy or compatibility reason. A read-only merge trial against the pre-review fork found nine conflicts, including execution orchestration and dependency metadata. A blanket merge or an `ours` merge that merely hides differences would be misleading. Reassess normal merge feasibility on later releases rather than treating selective adaptation as a permanent requirement.
 

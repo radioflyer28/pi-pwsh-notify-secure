@@ -6,7 +6,7 @@ Review range: upstream `v0.5.0` (`4a7a48a03e3db3a6d7da901c5d0db1668560be85`) thr
 
 Stay behaviorally aligned with upstream wherever policy permits. Adopt the resolver and inherited-pipe improvements; retain equivalent or stronger existing fork behavior. Do not wholesale replace the fork's execution, notification, result, or dependency modules. A `git merge-tree --write-tree --name-only HEAD v0.6.0` trial before this adaptation reported nine conflicts: `.gitignore`, `README.md`, `package-lock.json`, `package.json`, `src/index.ts`, `src/notification-queue.ts`, `src/runtime.ts`, `test/run-tests.mts`, and `tsconfig.json`. It did not start a merge or alter tracked files.
 
-This is a selective semantic sync, not a merge/cherry-pick or an upstream ancestry claim. Advancing the reviewed drift baseline records that every incoming change was assessed, not that every upstream choice was copied. The package/install tag remains `v0.5.0-secure.7`; release and installation updates require separate approval.
+This is a selective semantic sync, not a merge/cherry-pick or an upstream ancestry claim. Advancing the reviewed drift baseline records that every incoming change was assessed, not that every upstream choice was copied. At the time of this review, the package/install tag was still `v0.5.0-secure.7`; release creation and installation updates were separate approval steps.
 
 ## Commit accounting
 

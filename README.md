@@ -1,14 +1,24 @@
 # pi-pwsh-notify-secure
 
-Security-hardened fork of [oversk7/pi-pwsh-notify](https://github.com/oversk7/pi-pwsh-notify). The development tree selectively tracks upstream **0.6.0**; the published and installed tag remains `0.5.0-secure.7` until a separately approved release. Upstream 0.6.0 now shares absolute executable resolution and metadata-only notifications. This fork retains its no-policy-bypass and no-default-complete-log policies, older-host compatibility, and structured results.
+Security-hardened fork of [oversk7/pi-pwsh-notify](https://github.com/oversk7/pi-pwsh-notify). Release **`0.6.0-secure.1`** selectively tracks upstream **0.6.0**. Upstream 0.6.0 now shares absolute executable resolution and metadata-only notifications. This fork retains its no-policy-bypass and no-default-complete-log policies, older-host compatibility, and structured results.
 
 English | [中文说明](#中文说明)
 
 Trusted PowerShell shell for [pi](https://pi.dev) on Windows (PowerShell 7 preferred, Windows PowerShell fallback), with **Claude Code-style background jobs that auto-notify the agent on completion** — no polling.
 
 ```
-pi install git:github.com/radioflyer28/pi-pwsh-notify-secure@v0.5.0-secure.7
+pi install git:github.com/radioflyer28/pi-pwsh-notify-secure@v0.6.0-secure.1
 ```
+
+## Release 0.6.0-secure.1
+
+- Selectively synchronized with upstream 0.6.0, including direct Store-alias probing and fully qualified Windows executable paths.
+- Inherited output pipes are drained rather than destroyed, avoiding broken writes in surviving descendants; idle settlement rechecks queued activity.
+- Pi 1.5 host-owned keybinding hints are honored, while Pi/TUI 0.84.3 remains the supported peer floor.
+- The development lock uses Pi/TUI 1.5.0 with reviewed Undici 8.12.3 and minimatch 11.0.3 fixes; the seven-day npm release-age policy is unchanged.
+- Preserves metadata-only automatic notifications, bounded in-memory output, no default complete-output logs, and no forced execution-policy bypass.
+
+Creating this release does not update existing installations. The [upstream adaptation matrix](docs/research/upstream-0.6.0-secure-adaptation.md) records intentional differences and verification limits, including deferred interactive visual checks and conditional live Store-alias coverage.
 
 ## Why
 
@@ -195,7 +205,7 @@ To validate against a managed 1.2.0 installation without changing dependencies o
 Windows 下给 [pi](https://pi.dev) 用的 PowerShell 7 shell，带 Claude Code 风格的后台任务：**任务结束后自动通知 agent，无需轮询**。
 
 ```
-pi install git:github.com/radioflyer28/pi-pwsh-notify-secure@v0.5.0-secure.7
+pi install git:github.com/radioflyer28/pi-pwsh-notify-secure@v0.6.0-secure.1
 ```
 
 ### 它解决的问题
