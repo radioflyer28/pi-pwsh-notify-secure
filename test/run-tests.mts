@@ -222,9 +222,15 @@ test("cwd assertions compare canonical paths across Windows short-name aliases",
     assert.ok(dir, "ProgramFiles must identify an existing directory");
     const escaped = dir.replaceAll("'", "''");
     const result = await harness.call("pwsh", {
-      command: `$folder = (New-Object -ComObject Scripting.FileSystemObject).GetFolder('${escaped}'); Write-Output $folder.ShortPath`,
+      command: `Set-Location '${escaped}'; $folder = (New-Object -ComObject Scripting.FileSystemObject).GetFolder('${escaped}'); Write-Output $folder.ShortPath`,
     });
-    const shortPath = textOf(result).trim();
+    // Force the hosted-runner failure shape even when the local cwd has no 8.3 alias.
+    assert.match(textOf(result), /cwd is now /);
+    assert.equal(result.structuredContent.kind, "foreground");
+    assert.equal(result.structuredContent.execution.exit_code, 0);
+    assert.equal(typeof result.structuredContent.output, "string");
+    const shortPath = result.structuredContent.output.trim();
+    assert.throws(() => assertSameDirectory(textOf(result), dir), { code: "ENOENT" });
     assertSameDirectory(shortPath, dir);
     assert.throws(() => assertSameDirectory(shortPath, REPO), assert.AssertionError);
     if (shortPath.toLowerCase() === dir.toLowerCase()) {
