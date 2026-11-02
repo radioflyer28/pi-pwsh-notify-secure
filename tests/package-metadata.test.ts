@@ -12,26 +12,26 @@ test("the hardened git package cannot be published to npm accidentally", () => {
 	assert.equal(packageJson.publishConfig, undefined);
 });
 
-test("Pi peer floor, Pi 1.1.0 development versions, and TypeBox import are consistent", () => {
+test("Pi peer floor, Pi 1.5.0 development versions, and TypeBox import are consistent", () => {
 	assert.equal(packageJson.peerDependencies["@earendil-works/pi-coding-agent"], ">=0.84.3");
 	assert.equal(packageJson.peerDependencies["@earendil-works/pi-tui"], ">=0.84.3");
-	assert.equal(packageJson.devDependencies["@earendil-works/pi-coding-agent"], "1.1.0");
-	assert.equal(packageJson.devDependencies["@earendil-works/pi-tui"], "1.1.0");
+	assert.equal(packageJson.devDependencies["@earendil-works/pi-coding-agent"], "1.5.0");
+	assert.equal(packageJson.devDependencies["@earendil-works/pi-tui"], "1.5.0");
 	assert.equal(packageJson.peerDependencies.typebox, "^1.3.7");
 	assert.equal(packageJson.peerDependencies["@sinclair/typebox"], undefined);
 	assert.match(indexSource, /from "typebox"/);
 	assert.doesNotMatch(indexSource, /@sinclair\/typebox/);
 });
 
-test("documentation distinguishes Pi 1.1.0 compatibility from the locked development baseline", () => {
+test("documentation distinguishes older-host compatibility from the locked Pi 1.5.0 baseline", () => {
 	assert.match(readme, /0\.84\.3 \/ 0\.87\.1 \/ 0\.99\.1 \/ 1\.1\.0/);
-	assert.match(readme, /default `1\.1\.0`/);
+	assert.match(readme, /default `1\.5\.0`/);
 	assert.match(readme, /seven-day npm release-age policy/);
 	assert.match(readme, /persisted `durationMs`/);
 	assert.match(readme, /fullscreen.*regular/);
 });
 
-test("host fixtures pin coordinated Pi packages and include Pi 1.5 without changing the default", async () => {
+test("host fixtures pin coordinated Pi packages and default to Pi 1.5", async () => {
 	const runner = await readFile(new URL("../scripts/test-host.mts", import.meta.url), "utf8");
 	const workflow = await readFile(new URL("../.github/workflows/compatibility.yml", import.meta.url), "utf8");
 	const versions = ["0.84.3", "0.87.1", "0.99.1", "1.1.0", "1.2.0", "1.5.0"];
@@ -39,12 +39,25 @@ test("host fixtures pin coordinated Pi packages and include Pi 1.5 without chang
 	const matrixVersions = JSON.parse(workflow.match(/pi: (\[[^\n]+\])/)![1]);
 	assert.deepEqual(runnerVersions, versions);
 	assert.deepEqual(matrixVersions, versions);
-	assert.match(runner, /: "1\.1\.0";/);
+	assert.match(runner, /: "1\.5\.0";/);
 	const overrides = runner.split("overrides: {")[1].split("} }, null, 2)")[0];
 	for (const name of ["pi-tui", "pi-agent-core", "pi-ai", "pi-codemode", "pi-mcp", "chord", "pi-client", "pi-protocol"]) {
 		assert.ok(overrides.includes(`"@earendil-works/${name}": version`), `${name} must use the selected release`);
 	}
 	assert.doesNotMatch(runner, /--min-release-age/);
+});
+
+test("the development lock pins Pi 1.5 and patched Undici and minimatch releases", async () => {
+	const lock = JSON.parse(await readFile(new URL("../package-lock.json", import.meta.url), "utf8"));
+	assert.equal(lock.packages[""].devDependencies["@earendil-works/pi-coding-agent"], "1.5.0");
+	assert.equal(lock.packages[""].devDependencies["@earendil-works/pi-tui"], "1.5.0");
+	for (const [name, version] of [["undici", "8.12.3"], ["minimatch", "11.0.3"]]) {
+		const entries = Object.entries(lock.packages).filter(([path]) => path.endsWith(`/node_modules/${name}`) || path === `node_modules/${name}`);
+		assert.ok(entries.length > 0, `${name} must be present in the development lock`);
+		for (const [path, entry] of entries) {
+			assert.equal((entry as { version: string }).version, version, `${path} must use the reviewed patched release`);
+		}
+	}
 });
 
 test("release metadata and installation instructions use 0.5.0-secure.7", () => {
@@ -57,7 +70,7 @@ test("documentation records the secure upstream adaptation and compatibility beh
 	assert.match(readme, /metadata only/);
 	assert.match(readme, /not written to temporary or persistent log files by default/);
 	assert.match(readme, /`!` and `!!` editor shortcuts execute through the same trusted PowerShell runtime/);
-	assert.match(readme, /Pi\/TUI 1\.1\.0/);
+	assert.match(readme, /Pi\/TUI 1\.5\.0/);
 	assert.match(research, /selectively ports upstream `pi-pwsh-notify` 0\.5\.0 reliability work/);
 	assert.match(research, /creates no default complete-output logs/);
 });

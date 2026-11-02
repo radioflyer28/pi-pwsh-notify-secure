@@ -17,7 +17,7 @@ Pi 0.84.3 introduced an optional native `powershell` tool for ordinary foregroun
 1. Native Pi has no managed background jobs, persistent `cd`, blocking job wait, or ready/finished steering notifications.
 2. The native implementation examined at Pi 0.84.3 used unqualified executable discovery and cleanup helpers; this fork uses verified absolute executable paths and does not force `-ExecutionPolicy Bypass`.
 
-The peer floor remains Pi/TUI 0.84.3. The isolated Windows compatibility matrix targets Pi/TUI 0.84.3, 0.87.1, 0.99.1, 1.1.0, 1.2.0, and 1.5.0; the locked development dependency baseline is Pi/TUI 1.1.0. Pi 0.99 adds structured codemode results without requiring a host upgrade for ordinary tool use. See the [source-by-source Pi comparison](docs/research/pi-0.84.3-native-powershell.md), the [upstream 0.5.0 secure-adaptation matrix](docs/research/upstream-0.5.0-secure-adaptation.md), and the [upstream synchronization checklist](docs/maintenance/upstream-sync.md).
+The peer floor remains Pi/TUI 0.84.3. The isolated Windows compatibility matrix targets Pi/TUI 0.84.3, 0.87.1, 0.99.1, 1.1.0, 1.2.0, and 1.5.0; the locked development dependency baseline is Pi/TUI 1.5.0. Pi 0.99 adds structured codemode results without requiring a host upgrade for ordinary tool use. See the [source-by-source Pi comparison](docs/research/pi-0.84.3-native-powershell.md), the [upstream 0.5.0 secure-adaptation matrix](docs/research/upstream-0.5.0-secure-adaptation.md), and the [upstream synchronization checklist](docs/maintenance/upstream-sync.md).
 
 ### Symptoms this fixes
 
@@ -139,7 +139,7 @@ The shared runner never writes output logs. **Pi itself owns the `!`/`!!` output
 
 ## Requirements
 
-- Pi/TUI 0.84.3 or newer on Windows; locked development baseline 1.1.0, with Windows compatibility targets 0.84.3 / 0.87.1 / 0.99.1 / 1.1.0 / 1.2.0 / 1.5.0.
+- Pi/TUI 0.84.3 or newer on Windows; locked development baseline 1.5.0, with Windows compatibility targets 0.84.3 / 0.87.1 / 0.99.1 / 1.1.0 / 1.2.0 / 1.5.0.
 - PowerShell 7 (`pwsh`) is preferred — install with `winget install Microsoft.PowerShell`. Trusted Windows PowerShell 5.1 is retained as a fallback.
 
 ## Security hardening
@@ -153,9 +153,9 @@ The shared runner never writes output logs. **Pi itself owns the `!`/`!!` output
 
 Run `npm ci --ignore-scripts`, then `npm run check`. The codemode suite uses a local faux model provider with the real Pi AgentSession and QuickJS worker; it never calls a paid model. Codemode tests explicitly skip on pre-0.99 hosts; the Windows process integration suite still runs there.
 
-Use `npm run test:host -- --version 0.84.3` (also `0.87.1`, `0.99.1`, `1.1.0`, `1.2.0`, or `1.5.0`; default `1.1.0`) for an isolated pinned-host check. It does not alter this checkout's dependencies or installed Pi, and respects npm's release-age policy. The runner verifies host/TUI versions, pins coordinated Pi packages (including codemode/MCP) to the selected release to prevent cross-minor API drift, shares Pi's bundled TUI registry, and retains its temporary fixture lock and evidence. Replay its full transitive dependency set with `--lock <saved-host-package-lock.json>`; the checkout's lockfile pins the shared development tools. CI runs all six on Windows and uploads fixture locks for replay.
+Use `npm run test:host -- --version 0.84.3` (also `0.87.1`, `0.99.1`, `1.1.0`, `1.2.0`, or `1.5.0`; default `1.5.0`) for an isolated pinned-host check. It does not alter this checkout's dependencies or installed Pi, and respects npm's release-age policy. The runner verifies host/TUI versions, pins coordinated Pi packages (including codemode/MCP) to the selected release to prevent cross-minor API drift, shares Pi's bundled TUI registry, and retains its temporary fixture lock and evidence. Replay its full transitive dependency set with `--lock <saved-host-package-lock.json>`; the checkout's lockfile pins the shared development tools. CI runs all six on Windows and uploads fixture locks for replay.
 
-`--installed <absolute-Pi-package-directory>` instead tests an already-installed matching host without downloading packages; this is labeled an **installed-host smoke test**, not a clean-install test. Both bundled and sibling TUI layouts are supported, including Pi's managed installation. Neither path changes the configured Pi package tag. The development pins and lockfile target 1.1.0. This upgrade used an explicitly authorized, command-scoped `--min-release-age=0` override; the persistent seven-day npm release-age policy was not changed. Normal installs and the host runner continue to respect the configured policy. Local junctions to an installed host are not evidence of the locked baseline. See [Pi 0.99 assessment](docs/research/pi-0.99-package-assessment.md) for the migration rationale.
+`--installed <absolute-Pi-package-directory>` instead tests an already-installed matching host without downloading packages; this is labeled an **installed-host smoke test**, not a clean-install test. Both bundled and sibling TUI layouts are supported, including Pi's managed installation. Neither path changes the configured Pi package tag. The development pins and lockfile target 1.5.0, including patched Undici 8.12.3 and minimatch 11.0.3. The Pi 1.5 security upgrade used an explicitly authorized, command-scoped `--min-release-age=0` install override; the persistent seven-day npm release-age policy was not changed. No package-version overrides are needed. See [dependency security maintenance](docs/maintenance/dependency-security.md) for scope, advisory references, and verification. Normal installs and the host runner continue to respect the configured policy. Local junctions to an installed host are not evidence of the locked baseline. See [Pi 0.99 assessment](docs/research/pi-0.99-package-assessment.md) for the migration rationale.
 
 ### Pi 1.1.0 rendering and manual smoke checks
 
@@ -165,7 +165,7 @@ For interactive verification, test both `--tui-mode fullscreen` and `--tui-mode 
 
 ### Pi 1.5.0 keybinding hints
 
-Both tools use the host-injected `context.keyHint` for truncated calls and collapsed results on Pi 1.5+. Older contexts deliberately fall back to the imported SDK helper; an injected empty hint is respected as unbound. Reused component caches compare the rendered hint text, so a changed shortcut refreshes the row even when helper identity and result data stay unchanged. The peer floor and locked development baseline are unchanged.
+Both tools use the host-injected `context.keyHint` for truncated calls and collapsed results on Pi 1.5+. Older contexts deliberately fall back to the imported SDK helper; an injected empty hint is respected as unbound. Reused component caches compare the rendered hint text, so a changed shortcut refreshes the row even when helper identity and result data stay unchanged. The peer floor remains 0.84.3; the development baseline is now 1.5.0.
 
 Run `npm run test:host -- --version 1.5.0 --installed '<absolute path to @earendil-works/pi-coding-agent>'` for an isolated installed-host smoke check. The suite exercises a non-default expansion binding through Pi's real `ToolExecutionComponent` render context; this is component integration coverage, not an interactive visual test. Also verify a custom expansion shortcut in both regular and fullscreen terminal modes using the manual checks above.
 
@@ -173,7 +173,7 @@ Run `npm run test:host -- --version 1.5.0 --installed '<absolute path to @earend
 
 Idle background notifications now pass through Pi's `before_agent_start` as `messageType: "custom"`, with the starting `message` and no `prompt`. Integrations inspecting user prompts must narrow to `messageType: "user"`. Pi is busy during startup (`ctx.isIdle()` is false), so a notification arriving during a startup handler steers into that run instead of starting a competing run. The real-host suite covers both cases and checks that prompt sections survive the custom run's tool follow-up.
 
-Process/signal cleanup hooks are installed idempotently at `session_start`, not while loading the factory for resource discovery. The terminal job list is TUI-only; RPC/JSON/print retain execution and metadata-only notifications without registering terminal input. The default-direct tool exposure, schemas, legacy error bridge, peer floor, and locked 1.1.0 development dependencies are unchanged. No `reachesTools` or namespace is needed: these tools execute processes, not other Pi tools.
+Process/signal cleanup hooks are installed idempotently at `session_start`, not while loading the factory for resource discovery. The terminal job list is TUI-only; RPC/JSON/print retain execution and metadata-only notifications without registering terminal input. The default-direct tool exposure, schemas, legacy error bridge, and peer floor are unchanged; the development dependencies now target 1.5.0. No `reachesTools` or namespace is needed: these tools execute processes, not other Pi tools.
 
 To validate against a managed 1.2.0 installation without changing dependencies or Pi settings, run `npm run test:host -- --version 1.2.0 --installed '<absolute path to @earendil-works/pi-coding-agent>'`. This is an installed-host smoke check, not a pinned clean install.
 
@@ -223,7 +223,7 @@ agent 在后台启动构建或 dev server 后可以继续和你对话；进程�
 
 ### 要求
 
-Pi/TUI 0.84.3 或更高版本，运行于 Windows；锁定开发基线为 1.1.0；Windows 兼容测试目标为 0.84.3 / 0.87.1 / 0.99.1 / 1.1.0 / 1.2.0 / 1.5.0。建议 PowerShell 7（`winget install Microsoft.PowerShell`），未安装时保留可信的 Windows PowerShell 5.1 回退。`!`/`!!` 也会使用同一安全 PowerShell runtime；若找不到可信 runtime，本扩展工具停用并保留 Pi 内置 shell。
+Pi/TUI 0.84.3 或更高版本，运行于 Windows；锁定开发基线为 1.5.0；Windows 兼容测试目标为 0.84.3 / 0.87.1 / 0.99.1 / 1.1.0 / 1.2.0 / 1.5.0。建议 PowerShell 7（`winget install Microsoft.PowerShell`），未安装时保留可信的 Windows PowerShell 5.1 回退。`!`/`!!` 也会使用同一安全 PowerShell runtime；若找不到可信 runtime，本扩展工具停用并保留 Pi 内置 shell。
 
 ## License
 

@@ -10,7 +10,7 @@ import { createHash } from "node:crypto";
 const versions = ["0.84.3", "0.87.1", "0.99.1", "1.1.0", "1.2.0", "1.5.0"];
 const args = process.argv.slice(2);
 const option = (name: string) => args[args.indexOf(name) + 1];
-const version = args.includes("--version") ? option("--version") : "1.1.0";
+const version = args.includes("--version") ? option("--version") : "1.5.0";
 if (!versions.includes(version)) throw new Error(`Expected --version ${versions.join(" | ")}`);
 const repo = fileURLToPath(new URL("..", import.meta.url));
 const sandbox = await mkdtemp(join(tmpdir(), `pwsh-host-${version}-`));
@@ -50,7 +50,7 @@ for (const directory of [host, tui]) {
 }
 const work = join(sandbox, "package");
 await mkdir(work);
-for (const path of ["src", "tests", "test", "docs", "scripts", ".github", "README.md", "package.json", "tsconfig.json"]) {
+for (const path of ["src", "tests", "test", "docs", "scripts", ".github", "README.md", "package.json", "package-lock.json", "tsconfig.json"]) {
 	await cp(join(repo, path), join(work, path), { recursive: true });
 }
 const links: Record<string, string> = {
